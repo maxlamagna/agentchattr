@@ -65,6 +65,7 @@
     --radius-lg: 8px;
     --radius-xl: 12px;
     --radius-full: 9999px;
+    --day-header-h: 44px;
 
     /* --- Typography --- */
     --fs-xs: 11px;
@@ -647,6 +648,7 @@ main#timeline {
     overflow-x: hidden;
     padding: 16px;
     scroll-behavior: smooth;
+    scroll-padding-top: var(--day-header-h);
     min-width: 0;
     height: 100%;
 }
@@ -2549,8 +2551,13 @@ body.show-msg-numbers .msg-num {
 .date-divider {
     display: flex;
     align-items: center;
-    gap: 12px;
-    margin: 16px 0 8px;
+    justify-content: center;
+    margin: 0;
+    height: var(--day-header-h);
+    background: var(--bg);
+    position: sticky;
+    top: 0;
+    z-index: 6;
     color: var(--text-dim);
     font-size: 11px;
     font-weight: 600;
@@ -2559,12 +2566,11 @@ body.show-msg-numbers .msg-num {
     text-indent: 0.06em;
 }
 
-.date-divider::before,
-.date-divider::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: var(--border);
+.date-divider span {
+    background: var(--bg-msg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    padding: 3px 10px;
 }
 
 /* --- Code copy button --- */
