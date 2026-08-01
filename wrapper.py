@@ -366,10 +366,12 @@ def _build_provider_launch(
     return launch_args, launch_env, inject_env, settings_path
 
 
-def _register_instance(server_port: int, base: str, label: str | None = None) -> dict:
+def _register_instance(server_port: int, base: str, label: str | None = None,
+                       ready_gate: bool = False) -> dict:
     import urllib.request
 
-    reg_body = json.dumps({"base": base, "label": label}).encode()
+    reg_body = json.dumps({"base": base, "label": label,
+                           "ready_gate": ready_gate}).encode()
     reg_req = urllib.request.Request(
         f"http://127.0.0.1:{server_port}/api/register",
         method="POST",
@@ -453,13 +455,20 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
 
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10):
+                   refresh_interval: int = 10, ready_flag=None):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
     trigger_count = 0
     while True:
         try:
+            # Ready gate (TD-006, #3925.2): while the gate is held the watcher
+            # must not READ, CLEAR, or inject - reading here truncates the
+            # queue file, so an inject-only gate would silently erase mentions
+            # that arrive during a CLI restart.
+            if ready_flag is not None and not ready_flag[0]:
+                time.sleep(1)
+                continue
             _, queue_file = get_identity_fn()
             if queue_file.exists() and queue_file.stat().st_size > 0:
                 with open(queue_file, "r", encoding="utf-8") as f:
@@ -583,7 +592,50 @@ def main():
     parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
     parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
     parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    # Ready gate (TD-006, opt-in): register as `starting` and hold mention
+    # routing + heartbeats until the CLI pane provably matches a ready screen.
+    parser.add_argument("--ready-gate", action="store_true",
+                        help="Register as starting; gate CLI readiness before chat")
+    parser.add_argument("--ready-pattern", default=None,
+                        help="Regex for the CLI's known-ready screen")
+    parser.add_argument("--ready-blocker", action="append", default=[],
+                        metavar="LABEL=REGEX",
+                        help="Known blocker screen, repeatable (fails fast)")
+    parser.add_argument("--ready-timeout", type=int, default=90,
+                        help="Seconds before an unknown screen fails closed")
     args, extra = parser.parse_known_args()
+
+    # Validate the gate config BEFORE any registration or session mutation
+    # (#3925.10): an invalid regex must not fall through to normal
+    # deregistration and mint a reserved name.
+    ready_gate_cfg = None
+    if args.ready_gate:
+        import re as _re
+        if not args.ready_pattern:
+            print("  Error: --ready-gate requires --ready-pattern.")
+            sys.exit(2)
+        try:
+            _re.compile(args.ready_pattern)
+        except _re.error as exc:
+            print(f"  Error: --ready-pattern does not compile: {exc}")
+            sys.exit(2)
+        if args.ready_timeout <= 0:
+            print("  Error: --ready-timeout must be positive.")
+            sys.exit(2)
+        _blockers = []
+        for _spec in args.ready_blocker:
+            _label, _, _rx = _spec.partition("=")
+            if not _re.fullmatch(r"[a-z0-9-]+", _label or ""):
+                print(f"  Error: bad blocker label in {_spec!r} (want LABEL=REGEX, label [a-z0-9-]+).")
+                sys.exit(2)
+            try:
+                _re.compile(_rx)
+            except _re.error as exc:
+                print(f"  Error: blocker regex for {_label!r} does not compile: {exc}")
+                sys.exit(2)
+            _blockers.append((_label, _rx))
+        ready_gate_cfg = {"pattern": args.ready_pattern, "blockers": _blockers,
+                          "timeout": args.ready_timeout}
 
     agent = args.agent
     agent_cfg = config.get("agents", {}).get(agent, {})
@@ -606,7 +658,8 @@ def main():
     mcp_cfg = config.get("mcp", {})
 
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_instance(server_port, agent, args.label,
+                                          ready_gate=args.ready_gate)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Wrapper cannot continue without a registered identity.")
@@ -666,6 +719,27 @@ def main():
     def get_token():
         with _identity_lock:
             return _identity["token"]
+
+    # Ready-gate state (TD-006). _ready_flag is the release switch for mention
+    # injection + heartbeats; _cli_proven_ready records that the pane passed
+    # the gate at least once (the 409-replacement path uses it to re-assert
+    # readiness without re-probing a healthy CLI, #3925.3).
+    _ready_flag = [False]
+    _cli_proven_ready = [False]
+    _pending_inject_fn = [None]
+    _watcher_started = [False]
+
+    def _post_transition(kind):
+        """Authenticated ready-gate transition POST. kind: starting|ready|cancel.
+        Raises on any failure - callers decide whether that is fatal."""
+        import urllib.request as _ur
+        current_name, _ = get_identity()
+        req = _ur.Request(
+            f"http://127.0.0.1:{server_port}/api/agent/{kind}/{current_name}",
+            method="POST", data=b"", headers=_auth_headers(get_token()),
+        )
+        with _ur.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
 
     # Rewrite MCP config when token/name changes (e.g. after 409 re-register).
     # Most CLIs won't re-read mid-session, but the file is correct for next restart.
@@ -754,6 +828,21 @@ def main():
 
     def _heartbeat():
         while True:
+            # Ready gate (TD-006): no heartbeats while the gate is held - a
+            # heartbeat would refresh presence for an agent that is not ready.
+            # This loop doubles as the retry engine for the 409-replacement
+            # path (#3925.3): once the CLI is proven ready, keep re-asserting
+            # the server-side ready transition until it succeeds.
+            if ready_gate_cfg and not _ready_flag[0]:
+                if _cli_proven_ready[0]:
+                    try:
+                        _post_transition("ready")
+                        _ready_flag[0] = True
+                    except Exception:
+                        pass
+                if not _ready_flag[0]:
+                    time.sleep(5)
+                    continue
             current_name, _ = get_identity()
             current_token = get_token()
             url = f"http://127.0.0.1:{server_port}/api/heartbeat/{current_name}"
@@ -772,8 +861,15 @@ def main():
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     try:
-                        replacement = _register_instance(server_port, agent, args.label)
+                        replacement = _register_instance(server_port, agent, args.label,
+                                                         ready_gate=args.ready_gate)
                         set_runtime_identity(replacement["name"], replacement["token"])
+                        # Ready gate (#3925.3): the replacement identity starts
+                        # in `starting` and must not skip the gate. Hold the
+                        # release; the loop-top retry re-asserts ready (the CLI
+                        # is already proven) until the server accepts it.
+                        if ready_gate_cfg:
+                            _ready_flag[0] = False
                         _notify_recovery(data_dir, replacement["name"])
                     except Exception:
                         pass
@@ -801,7 +897,8 @@ def main():
             args=(get_identity, inject_fn),
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                     "server_port": server_port, "agent_name": assigned_name,
-                    "get_token_fn": get_token, "refresh_interval": _refresh_interval},
+                    "get_token_fn": get_token, "refresh_interval": _refresh_interval,
+                    "ready_flag": _ready_flag if ready_gate_cfg else None},
             daemon=True,
         )
         _watcher_thread.start()
@@ -811,12 +908,15 @@ def main():
         while True:
             time.sleep(5)
             if _watcher_thread and not _watcher_thread.is_alive() and _watcher_inject_fn:
+                # Resurrection obeys the same pre-read gate (#3925.2): the
+                # replacement thread gets the SAME ready_flag reference.
                 _watcher_thread = threading.Thread(
                     target=_queue_watcher,
                     args=(get_identity, _watcher_inject_fn),
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                             "server_port": server_port, "agent_name": assigned_name,
-                            "get_token_fn": get_token, "refresh_interval": _refresh_interval},
+                            "get_token_fn": get_token, "refresh_interval": _refresh_interval,
+                            "ready_flag": _ready_flag if ready_gate_cfg else None},
                     daemon=True,
                 )
                 _watcher_thread.start()
@@ -824,6 +924,23 @@ def main():
                 _notify_recovery(data_dir, current_name)
 
     threading.Thread(target=_watcher_monitor, daemon=True).start()
+
+    def _stash_inject(fn):
+        """wrapper_unix stashes its inject fn here instead of starting the
+        watcher itself when the ready gate is armed; _on_ready starts it."""
+        _pending_inject_fn[0] = fn
+
+    def _on_ready():
+        """Ready release, in the mandated order (#3925.3): the server-side
+        transition must SUCCEED before any local release; the watcher starts
+        (once) only after that. Raises on failure - run_agent treats that as
+        a gate failure, never a local release."""
+        _post_transition("ready")
+        _cli_proven_ready[0] = True
+        _ready_flag[0] = True
+        if not _watcher_started[0] and _pending_inject_fn[0] is not None:
+            _watcher_started[0] = True
+            start_watcher(_pending_inject_fn[0])
 
     _activity_checker = None
 
@@ -837,6 +954,9 @@ def main():
         REPORT_INTERVAL = 3  # re-send state every 3s while active (keeps server lease fresh)
         while True:
             time.sleep(1)
+            # Ready gate (TD-006): no activity reports while the gate is held.
+            if ready_gate_cfg and not _ready_flag[0]:
+                continue
             if not _activity_checker:
                 continue
             try:
@@ -905,6 +1025,15 @@ def main():
         run_kwargs["enter_backend"] = agent_cfg.get("enter_backend", "console_input")
     if sys.platform != "win32":
         run_kwargs["session_name"] = unix_session_name
+        # Ready gate is unix-only (the boxes are linux); Windows keeps today's
+        # exact flow, and an ungated unix run passes all-None (same behavior).
+        run_kwargs["ready_gate_cfg"] = ready_gate_cfg
+        if ready_gate_cfg:
+            run_kwargs["on_starting"] = lambda: _post_transition("starting")
+            run_kwargs["on_ready"] = _on_ready
+            run_kwargs["on_failed"] = lambda c: _post_transition("cancel")
+            run_kwargs["clear_ready"] = lambda: _ready_flag.__setitem__(0, False)
+            run_kwargs["stash_inject_fn"] = _stash_inject
 
     try:
         run_agent(**run_kwargs)

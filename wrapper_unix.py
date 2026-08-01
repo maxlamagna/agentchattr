@@ -93,8 +93,21 @@ def run_agent(
     session_name=None,
     inject_env=None,
     inject_delay: float = 0.3,
+    ready_gate_cfg=None,
+    on_starting=None,
+    on_ready=None,
+    on_failed=None,
+    clear_ready=None,
+    stash_inject_fn=None,
 ):
-    """Run agent inside a tmux session, inject via tmux send-keys."""
+    """Run agent inside a tmux session, inject via tmux send-keys.
+
+    Ready gate (TD-006, opt-in via ready_gate_cfg): EVERY launch iteration -
+    initial and automatic restart - closes the gate, tells the server
+    `starting` BEFORE the session exists, probes the pane, and only a
+    successful server-side ready transition releases anything locally
+    (#3925.3). Any non-ready verdict kills the session, cancels the
+    registration, and exits 3 without entering the restart loop."""
     _check_tmux()
 
     session_name = session_name or f"agentchattr-{agent}"
@@ -123,7 +136,12 @@ def run_agent(
 
     # Wire up injection with the tmux session name
     inject_fn = lambda text: inject(text, tmux_session=session_name, delay=inject_delay)
-    start_watcher(inject_fn)
+    if ready_gate_cfg is None:
+        start_watcher(inject_fn)        # ungated: today's behavior, unchanged
+    else:
+        # Gated: the wrapper starts the watcher only at the first successful
+        # ready transition; until then nothing may read or clear the queue.
+        stash_inject_fn(inject_fn)
 
     print(f"  Using tmux session: {session_name}")
     print(f"  Detach: Ctrl+B, D  (agent keeps running)")
@@ -131,6 +149,18 @@ def run_agent(
 
     while True:
         try:
+            if ready_gate_cfg is not None:
+                # Close the gate FIRST on every iteration (initial + restart),
+                # then tell the server `starting` BEFORE any session exists.
+                if clear_ready:
+                    clear_ready()
+                try:
+                    if on_starting:
+                        on_starting()
+                except Exception as exc:
+                    print(f"  READY-GATE: starting transition failed ({exc}); aborting")
+                    sys.exit(3)
+
             # Clean up stale session from a previous crash
             subprocess.run(
                 ["tmux", "kill-session", "-t", session_name],
@@ -146,6 +176,51 @@ def run_agent(
             if result.returncode != 0:
                 print(f"  Error: failed to create tmux session (exit {result.returncode})")
                 break
+
+            if ready_gate_cfg is not None:
+                from wrapper_ready import wait_cli_ready
+
+                def _cap():
+                    r = subprocess.run(
+                        ["tmux", "capture-pane", "-p", "-t", session_name],
+                        capture_output=True, timeout=5,
+                    )
+                    return r.stdout.decode(errors="replace") if r.returncode == 0 else None
+
+                verdict = wait_cli_ready(
+                    _cap,
+                    ready_gate_cfg["pattern"],
+                    ready_gate_cfg["blockers"],
+                    ready_gate_cfg["timeout"],
+                    session_alive_fn=lambda: _session_exists(session_name),
+                )
+                if verdict != "ready":
+                    # No raw pane in the log (OAuth material): classification
+                    # plus the exact command to look at the live screen.
+                    print(f"  READY-GATE FAILED ({verdict}) - inspect: "
+                          f"tmux capture-pane -p -t {session_name} -S -100")
+                    subprocess.run(["tmux", "kill-session", "-t", session_name],
+                                   capture_output=True)
+                    if on_failed:
+                        try:
+                            on_failed(verdict)
+                        except Exception:
+                            pass
+                    sys.exit(3)      # never falls into the restart loop
+                try:
+                    if on_ready:
+                        on_ready()   # server transition first; raises = failure
+                except Exception as exc:
+                    print(f"  READY-GATE FAILED (ready-post: {exc}) - inspect: "
+                          f"tmux capture-pane -p -t {session_name} -S -100")
+                    subprocess.run(["tmux", "kill-session", "-t", session_name],
+                                   capture_output=True)
+                    if on_failed:
+                        try:
+                            on_failed("ready-post-failed")
+                        except Exception:
+                            pass
+                    sys.exit(3)
 
             # Attach — blocks until agent exits or user detaches (Ctrl+B, D)
             subprocess.run(["tmux", "attach-session", "-t", session_name])
