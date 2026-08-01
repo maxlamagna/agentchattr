@@ -404,6 +404,14 @@ function connectWebSocket() {
                 playNotificationSound(event.data.sender);
             }
             appendMessage(event.data);
+        } else if (event.type === 'agent_ready') {
+            // Ready gate (TD-006): flip the pill out of 'starting' right away;
+            // the next status update paints the final available/working class.
+            const readyPill = document.getElementById(`status-${event.name}`);
+            if (readyPill) {
+                readyPill.classList.remove('starting');
+                readyPill.classList.add('available');
+            }
         } else if (event.type === 'agent_renamed') {
             // Migrate active mentions before the agents config rebuild
             if (activeMentions.has(event.old_name)) {
@@ -1209,6 +1217,7 @@ function buildStatusPills() {
         const pill = document.createElement('div');
         pill.className = 'status-pill';
         if (cfg.state === 'pending') pill.classList.add('pending');
+        if (cfg.state === 'starting') pill.classList.add('starting');
         pill.id = `status-${name}`;
         pill.title = `@${name}`;  // Tooltip: canonical name for manual @-typing
         pill.style.setProperty('--agent-color', colorOverrides[name] || cfg.color || '#4ade80');
@@ -1763,10 +1772,14 @@ function updateStatus(data) {
         const pill = document.getElementById(`status-${name}`);
         if (!pill) continue;
 
-        pill.classList.remove('available', 'working', 'offline');
+        pill.classList.remove('available', 'working', 'offline', 'starting');
         // Pending pills keep their pending animation (set in buildStatusPills)
         if (!pill.classList.contains('pending')) {
-            if (info.busy && info.available) {
+            if (info.state === 'starting') {
+                // Ready gate (TD-006): registered but the CLI is not proven
+                // ready - distinct from offline, never shown as available.
+                pill.classList.add('starting');
+            } else if (info.busy && info.available) {
                 pill.classList.add('working');
             } else if (info.available) {
                 pill.classList.add('available');

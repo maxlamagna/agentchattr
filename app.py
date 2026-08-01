@@ -209,7 +209,7 @@ def _install_security_middleware(token: str, cfg: dict):
             # Allow registered agents to authenticate via Bearer token
             # for /api/messages and /api/send (no browser session needed).
             auth_header = request.headers.get("authorization", "")
-            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send") or path.startswith("/api/rules/")):
+            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send") or path.startswith("/api/rules/") or path.startswith("/api/agent/")):
                 bearer = auth_header[7:].strip()
                 if _self.registry and _self.registry.resolve_token(bearer):
                     return await call_next(request)
@@ -287,7 +287,7 @@ def configure(cfg: dict, session_token: str = ""):
         max_hops=max_hops,
         online_checker=lambda: set(registry.get_active_names()) if registry else set(),
     )
-    agents = AgentTrigger(registry, data_dir=data_dir)
+    agents = AgentTrigger(registry, data_dir=data_dir, store=store)
 
     # Sessions
     ROOT = Path(__file__).parent
@@ -853,12 +853,35 @@ async def _handle_new_message(msg: dict):
     sender_is_agent = sender in known_agents
     allowed_agent = session_engine.get_allowed_agent(channel) if session_engine and sender_is_agent else None
 
+    await _route_targets(targets, chat_msg, channel,
+                         custom_prompt=custom_prompt, allowed_agent=allowed_agent)
+
+
+async def _route_targets(targets, chat_msg, channel, custom_prompt="",
+                         allowed_agent=None):
+    """Deliver one message's mentions to agent queues.
+
+    Extracted from the new-message handler so the routing contract is
+    directly testable (codex #3925.1). Branch ORDER is load-bearing: the
+    ready-gate starting branch must run BEFORE the offline/queued notice -
+    a starting agent has no presence, so the offline branch would otherwise
+    emit "message queued" while the gate guarantees nothing is queued.
+    """
     import mcp_bridge
     for target in targets:
-        # Skip pending instances — they haven't been named/claimed yet
         if registry:
             inst = registry.get_instance(target)
+            # Skip pending instances — they haven't been named/claimed yet
             if inst and inst.get("state") == "pending":
+                continue
+            # Ready gate (TD-006, spec D1.4): visibly undelivered, no queue
+            # entry that startup cleanup could erase.
+            if inst and inst.get("state") == "starting":
+                store.add(
+                    "system",
+                    f"@{target} is starting; your mention was not delivered - "
+                    "resend once it shows ready.",
+                    msg_type="system", channel=channel)
                 continue
         # Session guard: suppress out-of-turn agent triggers
         if allowed_agent and target != allowed_agent:
@@ -2118,13 +2141,17 @@ async def register_agent(request: Request):
     label = body.get("label")
     if not base:
         return JSONResponse({"error": "base is required"}, status_code=400)
-    result = registry.register(base, label)
+    ready_gate = bool(body.get("ready_gate", False))
+    result = registry.register(base, label, ready_gate=ready_gate)
     if result is None:
         return JSONResponse({"error": f"unknown base: {base}"}, status_code=400)
-    # Touch presence so the instance doesn't immediately time out
     import mcp_bridge
-    with mcp_bridge._presence_lock:
-        mcp_bridge._presence[result["name"]] = __import__("time").time()
+    if not ready_gate:
+        # Touch presence so the instance doesn't immediately time out
+        with mcp_bridge._presence_lock:
+            mcp_bridge._presence[result["name"]] = __import__("time").time()
+    # Ready gate (TD-006): a starting instance gets NO presence touch - it
+    # must not appear online until the authenticated ready transition.
     # If slot 1 was renamed (e.g. "claude" → "claude-1"), migrate state
     renamed = result.pop("_renamed_slot1", None)
     if renamed:
@@ -2149,6 +2176,73 @@ async def register_agent(request: Request):
         })
         asyncio.run_coroutine_threadsafe(_broadcast(pending_event), _event_loop)
     return JSONResponse(result)
+
+
+def _instance_token_auth(request: Request, name: str):
+    """403 unless the Bearer token resolves to exactly this instance.
+
+    Ready-gate transitions are wrapper-authenticated (codex #3925.5 auth
+    matrix): no token, a wrong token, or ANOTHER instance's valid token all
+    refuse. resolve_token works for starting instances - their token is
+    issued at registration."""
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    inst = registry.resolve_token(auth[7:].strip()) if registry else None
+    if not inst or inst.get("name") != name:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    return None
+
+
+@app.post("/api/agent/starting/{name}")
+async def agent_starting(name: str, request: Request):
+    """Re-enter the gate before a CLI (re)start. Order (#3925.3): presence is
+    purged BEFORE the state flips, so no client observes an online starting
+    agent; registry._notify fires once, after both."""
+    err = _instance_token_auth(request, name)
+    if err:
+        return err
+    import mcp_bridge
+    mcp_bridge.purge_identity(name)
+    if not registry.mark_starting(name):
+        return JSONResponse({"error": "unknown instance or illegal state"},
+                            status_code=404)
+    return {"ok": True, "state": "starting"}
+
+
+@app.post("/api/agent/ready/{name}")
+async def agent_ready(name: str, request: Request):
+    """Authenticated ready transition. Order (#3925.3): presence first, then
+    the state flip (whose _notify announces a consistent snapshot), then the
+    SSE event; a refused flip rolls presence back."""
+    err = _instance_token_auth(request, name)
+    if err:
+        return err
+    import mcp_bridge
+    with mcp_bridge._presence_lock:
+        mcp_bridge._presence[name] = __import__("time").time()
+    if not registry.mark_ready(name):
+        with mcp_bridge._presence_lock:
+            mcp_bridge._presence.pop(name, None)
+        return JSONResponse({"error": "not in starting state"}, status_code=409)
+    if _event_loop:
+        ready_event = json.dumps({"type": "agent_ready", "name": name})
+        asyncio.run_coroutine_threadsafe(_broadcast(ready_event), _event_loop)
+    return {"ok": True, "state": "active"}
+
+
+@app.post("/api/agent/cancel/{name}")
+async def agent_cancel(name: str, request: Request):
+    """Failed gate: cancel the starting registration with NO reservation and
+    NO reclaimable entry (spec D1.5) and purge any presence trace."""
+    err = _instance_token_auth(request, name)
+    if err:
+        return err
+    if not registry.cancel_starting(name):
+        return JSONResponse({"error": "not a starting instance"}, status_code=404)
+    import mcp_bridge
+    mcp_bridge.purge_identity(name)
+    return {"ok": True}
 
 
 @app.post("/api/deregister/{name}")

@@ -286,6 +286,20 @@ header h1 {
     50% { opacity: 1; }
 }
 
+/* Starting state (ready gate, TD-006) — registered but the CLI screen is not
+   proven ready yet: solid border (unlike pending's dashed = unnamed), dimmed,
+   with the pending pulse so it reads as "in motion, not usable yet". */
+.status-pill.starting {
+    border-color: var(--agent-color, #888);
+    opacity: 0.6;
+    animation: pending-pulse 2s ease-in-out infinite;
+}
+
+.status-pill.starting .status-dot {
+    background: var(--agent-color, #888);
+    animation: pending-dot-blink 1.5s ease-in-out infinite;
+}
+
 /* Working state — rotating border in agent color */
 @property --border-angle {
     syntax: "<angle>";
