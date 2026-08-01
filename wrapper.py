@@ -838,6 +838,7 @@ def main():
                     try:
                         _post_transition("ready")
                         _ready_flag[0] = True
+                        print("  READY-GATE PASSED - CLI proven ready; mention delivery released")
                     except Exception:
                         pass
                 if not _ready_flag[0]:
@@ -941,6 +942,9 @@ def main():
         if not _watcher_started[0] and _pending_inject_fn[0] is not None:
             _watcher_started[0] = True
             start_watcher(_pending_inject_fn[0])
+        # Host-side gates (workbench, update-boxes) poll the wrapper log for
+        # this exact marker - the success twin of "READY-GATE FAILED".
+        print("  READY-GATE PASSED - CLI proven ready; mention delivery released")
 
     _activity_checker = None
 
