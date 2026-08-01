@@ -1029,10 +1029,19 @@ def main():
         # exact flow, and an ungated unix run passes all-None (same behavior).
         run_kwargs["ready_gate_cfg"] = ready_gate_cfg
         if ready_gate_cfg:
+            def _clear_ready():
+                # Per-iteration/death close. The proven-ready latch is only
+                # valid for the SAME CLI process: without resetting it here,
+                # the heartbeat loop's 409-retry engine would re-assert ready
+                # for a dead CLI the moment a restart re-enters `starting`,
+                # reopening the gate mid-probe (#3925.3). The 409-replacement
+                # path deliberately keeps the latch - its CLI is still alive.
+                _ready_flag[0] = False
+                _cli_proven_ready[0] = False
             run_kwargs["on_starting"] = lambda: _post_transition("starting")
             run_kwargs["on_ready"] = _on_ready
             run_kwargs["on_failed"] = lambda c: _post_transition("cancel")
-            run_kwargs["clear_ready"] = lambda: _ready_flag.__setitem__(0, False)
+            run_kwargs["clear_ready"] = _clear_ready
             run_kwargs["stash_inject_fn"] = _stash_inject
 
     try:

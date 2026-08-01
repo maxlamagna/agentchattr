@@ -233,9 +233,18 @@ def run_agent(
                 print(f"  Reattach: tmux attach -t {session_name}")
                 while _session_exists(session_name):
                     time.sleep(1)
+                # CLI died while detached: close the gate before winding down
+                # so the watcher cannot read/clear a mention for a dead pane.
+                if ready_gate_cfg is not None and clear_ready:
+                    clear_ready()
                 break
 
-            # Session gone — agent exited
+            # Session gone — agent exited. Close the gate NOW (#3925.2): the
+            # loop-top re-entry only runs after the restart delay, and a
+            # mention arriving in that window must be neither consumed nor
+            # erased by the still-released watcher.
+            if ready_gate_cfg is not None and clear_ready:
+                clear_ready()
             if no_restart:
                 break
 

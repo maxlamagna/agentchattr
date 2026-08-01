@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# fake-tmux — PATH-shim tmux for the ready-gate integration suite (TD-006 T5).
+#
+# The wrapper under test shells out to `tmux`; installing this stub first on
+# PATH lets the suite script the CLI pane deterministically with no real tmux
+# and no real agent binary. State lives in $FAKE_TMUX_DIR:
+#
+#   calls.log        every invocation's argv (assert e.g. "one new-session")
+#   session.<name>   flag file; existence == the tmux session is alive
+#   scenario         pane script, one visible pane state per line; the Nth
+#                    PROBE capture serves the Nth line (last line repeats).
+#                    A line that is exactly "@DIE" kills the session flag
+#                    instead of printing (simulates the CLI dying mid-probe).
+#   scenario.idx     count of scenario lines consumed by probe captures
+#   keys.log         one line per send-keys invocation
+#
+# capture-pane disambiguation (load-bearing): the readiness probe calls
+# `capture-pane -p -t NAME` (-p first) and CONSUMES the next scenario line;
+# the activity checker calls `capture-pane -t NAME -p` and is served the
+# CURRENT line without consuming, so post-release activity polling can never
+# race the probe's scripted pane sequence.
+
+set -u
+
+if [ -z "${FAKE_TMUX_DIR:-}" ]; then
+    echo "fake-tmux: FAKE_TMUX_DIR is not set" >&2
+    exit 99
+fi
+mkdir -p "$FAKE_TMUX_DIR"
+
+printf '%s\n' "$*" >> "$FAKE_TMUX_DIR/calls.log"
+
+cmd="${1:-}"
+shift || true
+
+# Extract the -t/-s target from the remaining args.
+target=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-t" ] || [ "$prev" = "-s" ]; then
+        target="$arg"
+    fi
+    prev="$arg"
+done
+flag="$FAKE_TMUX_DIR/session.$target"
+
+serve_line() {
+    # $1 = 1-based line number to serve (capped to last line by caller)
+    sed -n "${1}p" "$FAKE_TMUX_DIR/scenario" 2>/dev/null
+}
+
+case "$cmd" in
+    has-session)
+        [ -f "$flag" ] && exit 0 || exit 1
+        ;;
+    new-session)
+        touch "$flag"
+        exit 0
+        ;;
+    kill-session)
+        rm -f "$flag"
+        exit 0
+        ;;
+    send-keys)
+        printf '%s\n' "$*" >> "$FAKE_TMUX_DIR/keys.log"
+        exit 0
+        ;;
+    attach-session)
+        # Real attach blocks until the session ends or the user detaches; the
+        # suite ends sessions by deleting the flag file.
+        while [ -f "$flag" ]; do
+            sleep 0.1
+        done
+        exit 0
+        ;;
+    capture-pane)
+        [ -f "$flag" ] || exit 1
+        total=$(wc -l < "$FAKE_TMUX_DIR/scenario" 2>/dev/null || echo 0)
+        total=$((total + 0))
+        [ "$total" -gt 0 ] || exit 0
+        idx=$(cat "$FAKE_TMUX_DIR/scenario.idx" 2>/dev/null || echo 0)
+        if [ "${1:-}" = "-p" ]; then
+            # Probe capture: consume the next line.
+            next=$((idx + 1))
+            [ "$next" -gt "$total" ] && next="$total"
+            echo "$next" > "$FAKE_TMUX_DIR/scenario.idx"
+            line=$(serve_line "$next")
+        else
+            # Activity capture: serve the current line, consume nothing.
+            cur="$idx"
+            [ "$cur" -lt 1 ] && cur=1
+            [ "$cur" -gt "$total" ] && cur="$total"
+            line=$(serve_line "$cur")
+        fi
+        if [ "$line" = "@DIE" ]; then
+            rm -f "$flag"
+            exit 0
+        fi
+        printf '%s\n' "$line"
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
