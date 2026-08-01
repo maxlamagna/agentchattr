@@ -346,6 +346,11 @@ class ProxyHeaderForwardingTests(unittest.TestCase):
                 pass
 
             def do_POST(self):
+                # Read the request body before responding: closing the socket
+                # with unread data makes the OS send RST, which can DISCARD the
+                # response sitting in the client's receive queue - the source of
+                # a load-sensitive 502 "Connection reset by peer" flake here.
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 seen["authorization"] = self.headers.get("Authorization")
                 seen["agent_token"] = self.headers.get("X-Agent-Token")
                 body = b'event: message\r\ndata: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\r\n\r\n'
