@@ -2203,7 +2203,9 @@ async def agent_starting(name: str, request: Request):
     if err:
         return err
     import mcp_bridge
-    mcp_bridge.purge_identity(name)
+    # Presence/activity ONLY (G3-1): a restart is not a deregistration - the
+    # read cursor and role are durable identity and must survive re-gating.
+    mcp_bridge.clear_presence(name)
     if not registry.mark_starting(name):
         return JSONResponse({"error": "unknown instance or illegal state"},
                             status_code=404)

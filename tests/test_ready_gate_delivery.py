@@ -124,5 +124,79 @@ class ReadyGateDeliveryTests(unittest.TestCase):
         self.assertEqual(self.store.messages, [])
 
 
+class FakeRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+class ReadyGateIdentityPreservationTests(unittest.TestCase):
+    """G3-1: a routine gated CLI restart must NOT destroy durable chat
+    identity. /api/agent/starting clears only presence/activity (no online
+    ghost); the read CURSOR and assigned ROLE survive, or every restart
+    replays consumed messages and silently drops the role. cancel and
+    deregister remain FULL purges - those are registration death."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.reg = RuntimeRegistry(data_dir=self._tmp.name)
+        self.reg.seed({"claude": {"label": "Claude", "color": "#da7756"}})
+        self._saved_registry = app_mod.registry
+        app_mod.registry = self.reg
+        self.inst = self.reg.register("claude", ready_gate=True)
+        now = time.time()
+        with mcp_bridge._presence_lock:
+            mcp_bridge._presence["claude"] = now
+            mcp_bridge._activity["claude"] = True
+            mcp_bridge._activity_ts["claude"] = now
+        with mcp_bridge._cursors_lock:
+            mcp_bridge._cursors["claude"] = {"general": 42}
+        mcp_bridge._roles["claude"] = "builder"
+
+    def tearDown(self):
+        app_mod.registry = self._saved_registry
+        with mcp_bridge._presence_lock:
+            mcp_bridge._presence.pop("claude", None)
+            mcp_bridge._activity.pop("claude", None)
+            mcp_bridge._activity_ts.pop("claude", None)
+        with mcp_bridge._cursors_lock:
+            mcp_bridge._cursors.pop("claude", None)
+        mcp_bridge._roles.pop("claude", None)
+        self._tmp.cleanup()
+
+    def _req(self):
+        return FakeRequest({"authorization": f"Bearer {self.inst['token']}"})
+
+    def test_starting_clears_presence_but_preserves_cursor_and_role(self):
+        resp = asyncio.run(app_mod.agent_starting("claude", self._req()))
+        self.assertEqual(resp, {"ok": True, "state": "starting"})
+        with mcp_bridge._presence_lock:
+            self.assertNotIn("claude", mcp_bridge._presence,
+                             "starting must purge presence (no online ghost)")
+            self.assertNotIn("claude", mcp_bridge._activity)
+        with mcp_bridge._cursors_lock:
+            self.assertEqual(mcp_bridge._cursors.get("claude"), {"general": 42},
+                             "restart must not reset the read cursor (replay)")
+        self.assertEqual(mcp_bridge._roles.get("claude"), "builder",
+                         "restart must not drop the assigned role")
+
+    def test_cancel_still_purges_fully(self):
+        resp = asyncio.run(app_mod.agent_cancel("claude", self._req()))
+        self.assertEqual(resp, {"ok": True})
+        with mcp_bridge._presence_lock:
+            self.assertNotIn("claude", mcp_bridge._presence)
+        with mcp_bridge._cursors_lock:
+            self.assertNotIn("claude", mcp_bridge._cursors)
+        self.assertNotIn("claude", mcp_bridge._roles)
+
+    def test_deregister_still_purges_fully(self):
+        resp = asyncio.run(app_mod.deregister_agent("claude", self._req()))
+        self.assertEqual(resp.status_code, 200)
+        with mcp_bridge._presence_lock:
+            self.assertNotIn("claude", mcp_bridge._presence)
+        with mcp_bridge._cursors_lock:
+            self.assertNotIn("claude", mcp_bridge._cursors)
+        self.assertNotIn("claude", mcp_bridge._roles)
+
+
 if __name__ == "__main__":
     unittest.main()

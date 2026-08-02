@@ -516,6 +516,21 @@ def migrate_identity(old_name: str, new_name: str):
     _save_cursors()
 
 
+def clear_presence(name: str):
+    """Clear only the LIVE presence/activity state for an agent.
+
+    Used by the ready-gate's re-entry into `starting` (TD-006 G3-1): a routine
+    CLI restart must not look online, but it is NOT a deregistration - the
+    read cursor and assigned role are durable identity and must survive, or
+    every restart replays already-consumed messages and silently drops the
+    role. Registration death (cancel/deregister) uses purge_identity below.
+    """
+    with _presence_lock:
+        _presence.pop(name, None)
+        _activity.pop(name, None)
+        _activity_ts.pop(name, None)
+
+
 def purge_identity(name: str):
     """Remove all runtime state for a deregistered agent (presence, activity, cursors, roles)."""
     with _presence_lock:
