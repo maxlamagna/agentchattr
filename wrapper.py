@@ -942,8 +942,13 @@ def main():
         if not _watcher_started[0] and _pending_inject_fn[0] is not None:
             _watcher_started[0] = True
             start_watcher(_pending_inject_fn[0])
-        # Host-side gates (workbench, update-boxes) poll the wrapper log for
-        # this exact marker - the success twin of "READY-GATE FAILED".
+        # DIAGNOSTIC ONLY - no host gate takes success from this line. Both the
+        # workbench and the update gate read live state=active AND available=true
+        # from the status API instead, because a successful wrapper never exits:
+        # with stdout redirected to a file this stays block-buffered unless the
+        # launcher passes -u, so it cannot be relied on as a success signal.
+        # "READY-GATE FAILED" is different and IS relied on: failure aborts the
+        # wrapper, and process exit flushes the buffer.
         print("  READY-GATE PASSED - CLI proven ready; mention delivery released")
 
     _activity_checker = None
