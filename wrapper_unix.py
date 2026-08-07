@@ -195,12 +195,26 @@ def run_agent(
                     session_alive_fn=lambda: _session_exists(session_name),
                 )
                 if verdict != "ready":
-                    # No raw pane in the log (OAuth material): classification
-                    # plus the exact command to look at the live screen.
-                    print(f"  READY-GATE FAILED ({verdict}) - inspect: "
-                          f"tmux capture-pane -p -t {session_name} -S -100")
-                    subprocess.run(["tmux", "kill-session", "-t", session_name],
-                                   capture_output=True)
+                    # No raw pane in the log (OAuth material): classification,
+                    # and the inspect command ONLY where a pane survives to be
+                    # inspected. Naming capture-pane for a verdict whose pane is
+                    # gone is the same known-bad command the host stops were
+                    # classified to avoid, one level down (G3 P2-1).
+                    if verdict == "timeout" or verdict.startswith("blocker:"):
+                        # TD-008: these are ANSWERABLE screens - keep the pane
+                        # so the operator can rescue (the host gate attaches,
+                        # the human answers, the next launch cleans the stale
+                        # session).
+                        print(f"  READY-GATE FAILED ({verdict}) - inspect: "
+                              f"tmux capture-pane -p -t {session_name} -S -100")
+                        print("  Pane left alive for rescue (TD-008)")
+                    else:
+                        # `died` never had a session; anything else here is not a
+                        # dialog and is torn down on the next line.
+                        print(f"  READY-GATE FAILED ({verdict}) - no live pane; "
+                              f"read this log, not the screen")
+                        subprocess.run(["tmux", "kill-session", "-t", session_name],
+                                       capture_output=True)
                     if on_failed:
                         try:
                             on_failed(verdict)
@@ -211,8 +225,10 @@ def run_agent(
                     if on_ready:
                         on_ready()   # server transition first; raises = failure
                 except Exception as exc:
-                    print(f"  READY-GATE FAILED (ready-post: {exc}) - inspect: "
-                          f"tmux capture-pane -p -t {session_name} -S -100")
+                    # The pane is killed on the very next line, so do not send the
+                    # operator to it (G3 P2-1).
+                    print(f"  READY-GATE FAILED (ready-post: {exc}) - no live pane; "
+                          f"read this log, not the screen")
                     subprocess.run(["tmux", "kill-session", "-t", session_name],
                                    capture_output=True)
                     if on_failed:

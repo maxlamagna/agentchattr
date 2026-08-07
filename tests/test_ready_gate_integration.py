@@ -282,6 +282,92 @@ class GatedWrapperLifecycleTests(unittest.TestCase):
         poll_until(lambda: name not in server.status(), 5,
                    "fail path to cancel the registration once reachable")
 
+    def test_blocker_failure_leaves_pane_alive_for_rescue(self):
+        # TD-008 D2: blocker screens are ANSWERABLE - the wrapper must stop
+        # destroying the one artifact the operator needs. Roster still cancels.
+        server = self._server()
+        wrapper = Wrapper(self._tmp, server,
+                          scenario=["Log in to continue please", "idle"],
+                          blockers=("login=Log in",), ready_timeout=10)
+        self.addCleanup(wrapper.stop)
+
+        rc = wrapper.wait_exit(15)
+        self.assertEqual(rc, 3)
+        self.assertIn("READY-GATE FAILED (blocker:login)", wrapper.log())
+        self.assertIn("Pane left alive for rescue", wrapper.log())
+        self.assertTrue(wrapper.session_flag().exists(),
+                        "blocker failure must leave the tmux session running")
+        self.assertEqual(wrapper.keys_log(), "", "nothing may be injected")
+        # G3 P2-1 POSITIVE CONTROL: this pane IS alive, so the command must still
+        # be there. Withholding it everywhere would be the opposite over-correction.
+        self.assertIn("capture-pane", wrapper.log(),
+                      "an answerable, live pane must still name capture-pane")
+        poll_until(lambda: "claude" not in server.status(), 5,
+                   "blocker instance still cancelled server-side")
+
+    def test_timeout_failure_leaves_pane_alive_for_rescue(self):
+        server = self._server()
+        wrapper = Wrapper(self._tmp, server, scenario=["mystery meat screen"],
+                          ready_timeout=1)
+        self.addCleanup(wrapper.stop)
+
+        rc = wrapper.wait_exit(15)
+        self.assertEqual(rc, 3)
+        self.assertIn("READY-GATE FAILED (timeout)", wrapper.log())
+        self.assertIn("Pane left alive for rescue", wrapper.log())
+        self.assertTrue(wrapper.session_flag().exists(),
+                        "timeout must leave the tmux session running")
+        poll_until(lambda: "claude" not in server.status(), 5,
+                   "timed-out instance still cancelled server-side")
+
+    def test_died_failure_keeps_teardown(self):
+        # G1 P1-1 negative pin: died has no pane to keep - no rescue offer.
+        server = self._server()
+        wrapper = Wrapper(self._tmp, server,
+                          scenario=["booting", "@DIE", "dead"],
+                          ready_timeout=10)
+        self.addCleanup(wrapper.stop)
+
+        rc = wrapper.wait_exit(15)
+        self.assertEqual(rc, 3)
+        self.assertIn("READY-GATE FAILED (died)", wrapper.log())
+        self.assertNotIn("Pane left alive", wrapper.log())
+        self.assertFalse(wrapper.session_flag().exists())
+        # G3 P2-1: the log must not hand the operator a command for a pane that
+        # does not exist. The host stops were classified; this is the same
+        # defect one level down, in the log those stops point at.
+        self.assertNotIn("capture-pane", wrapper.log(),
+                         "died has no pane - the log must not prescribe capture-pane")
+
+    def test_ready_post_failure_still_kills_pane(self):
+        # G1 P1-1 negative pin: a ready-post failure is a server-transition
+        # error on a HEALTHY ready screen - nothing on the pane is answerable,
+        # so today's teardown stays.
+        server = self._server()
+        wrapper = Wrapper(self._tmp, server,
+                          scenario=["booting 1", "booting 2", "READY> yes"],
+                          ready_timeout=30)
+        self.addCleanup(wrapper.stop)
+
+        name = wrapper.registered_name()
+        poll_until(lambda: server.status().get(name, {}).get("state") == "starting",
+                   10, "instance to be starting before the server hangs")
+        server.suspend()
+        self.addCleanup(server.resume)
+        poll_until(lambda: "READY-GATE FAILED (ready-post" in wrapper.log(),
+                   20, "ready POST to fail against the hung server")
+        server.resume()
+
+        rc = wrapper.wait_exit(10)
+        self.assertEqual(rc, 3)
+        self.assertNotIn("Pane left alive", wrapper.log())
+        self.assertFalse(wrapper.session_flag().exists(),
+                         "ready-post failure must keep killing the session")
+        # G3 P2-1: this path kills the pane on the very next line, so offering
+        # capture-pane sends the operator to something already gone.
+        self.assertNotIn("capture-pane", wrapper.log(),
+                         "ready-post kills the pane - the log must not prescribe capture-pane")
+
     def test_cli_restart_regates_and_preserves_interim_queue(self):
         server = self._server()
         speaker = server.register("codex")
