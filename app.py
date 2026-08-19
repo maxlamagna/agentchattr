@@ -49,6 +49,9 @@ session_token: str = ""
 # Room settings (persisted to data/settings.json)
 room_settings: dict = {
     "title": "agentchattr",
+    # Shown beside the title, so several servers can be told apart without
+    # renaming the product itself. "" hides it.
+    "subtitle": "",
     "username": "user",
     "font": "sans",
     "channels": ["general"],
@@ -124,6 +127,30 @@ def _settings_path() -> Path:
     return Path(data_dir) / "settings.json"
 
 
+ROOM_SUBTITLE_MAX = 40
+
+
+def normalize_room_subtitle(value):
+    """Clean a room subtitle, or return None if it is not usable.
+
+    Collapses any internal whitespace so a pasted newline cannot break the
+    header across two lines, and caps the length so a long name cannot crowd
+    out the rest of the header.
+    """
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split())[:ROOM_SUBTITLE_MAX]
+
+
+def apply_room_subtitle(new: dict):
+    """Apply a subtitle from a settings payload, if present and usable."""
+    if "subtitle" not in new:
+        return
+    cleaned = normalize_room_subtitle(new["subtitle"])
+    if cleaned is not None:
+        room_settings["subtitle"] = cleaned
+
+
 def _load_settings():
     global room_settings
     p = _settings_path()
@@ -133,6 +160,9 @@ def _load_settings():
             room_settings.update(saved)
         except Exception:
             pass
+    # settings.json is hand-editable, so the file bypasses every check the
+    # live update path applies. Re-normalise on load rather than trust it.
+    room_settings["subtitle"] = normalize_room_subtitle(room_settings.get("subtitle")) or ""
     # Ensure "general" always exists and is first
     if "channels" not in room_settings or not room_settings["channels"]:
         room_settings["channels"] = ["general"]
@@ -1288,6 +1318,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 new = event.get("data", {})
                 if "title" in new and isinstance(new["title"], str):
                     room_settings["title"] = new["title"].strip() or "agentchattr"
+                apply_room_subtitle(new)
                 if "username" in new and isinstance(new["username"], str):
                     room_settings["username"] = new["username"].strip() or "user"
                 if "font" in new and new["font"] in ("mono", "serif", "sans"):
@@ -1618,29 +1649,46 @@ async def create_schedule(request: Request):
     targets = body.get("targets", [])
     channel = body.get("channel", "general")
     spec = body.get("spec", "")
-    one_shot = body.get("one_shot", False)
+    one_shot = bool(body.get("one_shot", False))
     send_at_date = body.get("send_at_date", "")  # "YYYY-MM-DD" for one-shot
     created_by = body.get("created_by", "user")
     if not prompt or not targets or not spec:
         return JSONResponse({"error": "prompt, targets, and spec are required"}, status_code=400)
+    # A relative send ("in 2h 30m") is resolved by the client, which posts the
+    # resulting moment directly; there is no recurrence to parse out of it.
+    # A send_at names a single moment, so it only means anything for a one-shot.
+    # A recurring request ignores it, exactly as it did before the field
+    # existed; that keeps an unparseable spec falling through to the 400 below
+    # instead of being stored as an unasked-for daily repeat.
+    explicit_send_at = None
+    if one_shot and body.get("send_at") is not None:
+        try:
+            explicit_send_at = float(body["send_at"])
+        except (TypeError, ValueError, OverflowError):
+            return JSONResponse(
+                {"error": "send_at must be an epoch timestamp"}, status_code=400
+            )
     interval_sec, daily_at = parse_schedule_spec(spec)
-    if interval_sec is None:
+    if interval_sec is None and explicit_send_at is None:
         return JSONResponse({"error": f"Invalid schedule spec: {spec}"}, status_code=400)
     # For one-shot, compute exact send_at timestamp from date + daily_at time
-    send_at = None
-    if one_shot and daily_at and send_at_date:
+    send_at = explicit_send_at
+    if send_at is None and one_shot and daily_at and send_at_date:
         import datetime as _dt
         try:
             dt = _dt.datetime.strptime(f"{send_at_date} {daily_at}", "%Y-%m-%d %H:%M")
             send_at = dt.timestamp()
         except ValueError:
             pass
-    s = schedules.create(
-        prompt=prompt, targets=targets, channel=channel,
-        interval_seconds=interval_sec, daily_at=daily_at,
-        one_shot=one_shot, send_at=send_at,
-        created_by=created_by,
-    )
+    try:
+        s = schedules.create(
+            prompt=prompt, targets=targets, channel=channel,
+            interval_seconds=interval_sec, daily_at=daily_at,
+            one_shot=one_shot, send_at=send_at,
+            created_by=created_by,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     return JSONResponse(s)
 
 
