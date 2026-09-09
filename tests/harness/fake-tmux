@@ -12,13 +12,22 @@
 #                    A line that is exactly "@DIE" kills the session flag
 #                    instead of printing (simulates the CLI dying mid-probe).
 #   scenario.idx     count of scenario lines consumed by probe captures
-#   keys.log         one line per send-keys invocation
+#   keys.log         one line per delivery to the pane: the send-keys argv, or
+#                    the exact text a paste-buffer drew from the buffer it named
+#   buffer.<name>    the text a `load-buffer -b <name>` read from stdin (or from
+#                    a file operand); `paste-buffer -b <name>` delivers it and
+#                    drops it with -d, `delete-buffer -b <name>` drops it and
+#                    fails when it is absent
 #
 # capture-pane disambiguation (load-bearing): the readiness probe calls
 # `capture-pane -p -t NAME` (-p first) and CONSUMES the next scenario line;
 # the activity checker calls `capture-pane -t NAME -p` and is served the
 # CURRENT line without consuming, so post-release activity polling can never
 # race the probe's scripted pane sequence.
+#
+# display-message -p -t NAME answers a live session with its pane id and exits
+# 1 when the session flag is gone, so an injection aimed at a dead CLI aborts
+# before it can reach the paste.
 
 set -u
 
@@ -49,6 +58,20 @@ serve_line() {
     sed -n "${1}p" "$FAKE_TMUX_DIR/scenario" 2>/dev/null
 }
 
+opt_operand() {
+    # $1 = flag whose operand to print (e.g. -b); prints nothing when absent
+    local want="$1"
+    shift
+    local prev="" arg
+    for arg in "$@"; do
+        if [ "$prev" = "$want" ]; then
+            printf '%s\n' "$arg"
+            return 0
+        fi
+        prev="$arg"
+    done
+}
+
 case "$cmd" in
     has-session)
         [ -f "$flag" ] && exit 0 || exit 1
@@ -59,6 +82,50 @@ case "$cmd" in
         ;;
     kill-session)
         rm -f "$flag"
+        exit 0
+        ;;
+    display-message)
+        # A dead session answers nothing; the wrapper's pane lookup fails and
+        # the injection aborts before it can load or paste anything.
+        [ -f "$flag" ] || exit 1
+        printf '%s\n' '%0'
+        exit 0
+        ;;
+    load-buffer)
+        # No session check: a real tmux server outlives its sessions, so a
+        # buffer may exist while no pane does.
+        bufname=$(opt_operand -b "$@")
+        [ -n "$bufname" ] || { echo "can't buffer name" >&2; exit 1; }
+        src="${@: -1}"
+        if [ "$src" = "-" ]; then
+            cat > "$FAKE_TMUX_DIR/buffer.$bufname"
+        elif [ -f "$src" ]; then
+            cp "$src" "$FAKE_TMUX_DIR/buffer.$bufname"
+        else
+            echo "no such file: $src" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    paste-buffer)
+        bufname=$(opt_operand -b "$@")
+        [ -n "$bufname" ] || bufname="buffer0"
+        buf="$FAKE_TMUX_DIR/buffer.$bufname"
+        [ -f "$buf" ] || { echo "can't find buffer: $bufname" >&2; exit 1; }
+        # -p (bracketed paste) is terminal state the pane would add; the flag
+        # is already visible in calls.log, so keys.log stays the plain bytes.
+        printf '%s\n' "$(cat "$buf")" >> "$FAKE_TMUX_DIR/keys.log"
+        for arg in "$@"; do
+            [ "$arg" = "-d" ] && rm -f "$buf"
+        done
+        exit 0
+        ;;
+    delete-buffer)
+        bufname=$(opt_operand -b "$@")
+        [ -n "$bufname" ] || { echo "can't buffer name" >&2; exit 1; }
+        buf="$FAKE_TMUX_DIR/buffer.$bufname"
+        [ -f "$buf" ] || { echo "can't find buffer: $bufname" >&2; exit 1; }
+        rm -f "$buf"
         exit 0
         ;;
     send-keys)
