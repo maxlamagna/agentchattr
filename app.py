@@ -62,7 +62,6 @@ room_settings: dict = {
 
 # Channel validation
 _CHANNEL_NAME_RE = _re.compile(r'^[a-z0-9][a-z0-9\-]{0,19}$')
-MAX_CHANNELS = 8
 
 # Agent hats (persisted to data/hats.json)
 agent_hats: dict[str, str] = {}  # { agent_name: svg_string }
@@ -441,7 +440,7 @@ def configure(cfg: dict, session_token: str = ""):
                         store.add(name, f"{name} disconnected", msg_type="leave", channel=_agent_last_channel.get(name, _last_active_channel))
 
                 # Clear leave debounce for agents that came back online
-                _posted_leave -= currently_online
+                _posted_leave.difference_update(currently_online)
 
                 # Detect other agents (non-registered) going offline
                 went_offline = (_known_online - currently_online) - timed_out
@@ -1156,8 +1155,14 @@ async def websocket_endpoint(websocket: WebSocket):
     # Sort history by timestamp to interleave messages from different channels correctly
     history.sort(key=lambda m: m.get("timestamp", 0))
     
-    for msg in history:
-        await websocket.send_text(json.dumps({"type": "message", "data": msg}))
+    # Saved messages have their own boundary; presence updates can arrive at
+    # any time and must never make old history look like new chat.
+    for offset in range(0, len(history), 100):
+        await websocket.send_text(json.dumps({
+            "type": "history", "messages": history[offset:offset + 100],
+        }))
+        await asyncio.sleep(0)
+    await websocket.send_text(json.dumps({"type": "history_complete"}))
 
     # Send status
     await broadcast_status()
@@ -1273,7 +1278,10 @@ async def websocket_endpoint(websocket: WebSocket):
             elif event.get("type") in ("decision_approve", "rule_activate"):
                 rid = event.get("id")
                 if rid is not None:
-                    rules.activate(int(rid))
+                    if not rules.activate(int(rid)):
+                        await websocket.send_text(json.dumps({
+                            "type": "rule_error", "error": "Rule no longer exists. Refresh the page.",
+                        }))
                 continue
 
             elif event.get("type") in ("decision_unapprove", "rule_deactivate"):
@@ -1434,8 +1442,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not name or not _CHANNEL_NAME_RE.match(name):
                     continue
                 if name in room_settings["channels"]:
-                    continue
-                if len(room_settings["channels"]) >= MAX_CHANNELS:
                     continue
                 room_settings["channels"].append(name)
                 _save_settings()
@@ -1845,14 +1851,16 @@ async def resolve_rule_proposal(msg_id: int, request: Request):
         return JSONResponse({"error": "not a rule proposal"}, status_code=400)
     body = await request.json()
     action = body.get("action", "")
-    meta = msg.get("metadata", {})
+    meta = dict(msg.get("metadata") or {})
     rule_id = meta.get("rule_id")
 
     if action == "activate" and rule_id is not None:
-        rules.activate(int(rule_id))
+        if not rules.activate(int(rule_id)):
+            return JSONResponse({"error": "Rule no longer exists."}, status_code=409)
         meta["status"] = "activated"
     elif action == "draft" and rule_id is not None:
-        rules.make_draft(int(rule_id))
+        if not rules.make_draft(int(rule_id)):
+            return JSONResponse({"error": "Rule no longer exists."}, status_code=409)
         meta["status"] = "drafted"
     elif action == "dismiss" and rule_id is not None:
         rules.delete(int(rule_id))

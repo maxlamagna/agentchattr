@@ -20,6 +20,8 @@ import sys
 import time
 import uuid
 
+TMUX_COMMAND_TIMEOUT = 5.0
+
 
 def _session_exists(session_name: str) -> bool:
     """Return True while the tmux session is still alive."""
@@ -46,7 +48,7 @@ def _pane_id(tmux_session: str) -> str | None:
     """Resolve the session's active pane once, so paste and Enter hit the same pane."""
     result = subprocess.run(
         ["tmux", "display-message", "-p", "-t", tmux_session, "#{pane_id}"],
-        capture_output=True,
+        capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
     )
     if result.returncode != 0:
         return None
@@ -55,7 +57,8 @@ def _pane_id(tmux_session: str) -> str | None:
 
 
 def _drop_buffer(name: str) -> None:
-    subprocess.run(["tmux", "delete-buffer", "-b", name], capture_output=True)
+    subprocess.run(["tmux", "delete-buffer", "-b", name],
+                   capture_output=True, timeout=TMUX_COMMAND_TIMEOUT)
 
 
 def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool:
@@ -72,10 +75,12 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool:
     bracketed paste gets the plain bytes, exactly as before.
 
     Returns True only when tmux accepted both the paste and Enter. On any
-    failure, a non-zero exit or an exception launching tmux, it prints a
+    failure, a non-zero exit, timeout or an exception launching tmux, it prints a
     diagnostic, cleans up its buffer on a best-effort basis, sends nothing
     further, and returns False (the queue watcher swallows exceptions, so a
-    raise alone would be invisible).
+    raise alone would be invisible). Each delivery and cleanup command has a
+    time limit so a stuck tmux cannot block the queue watcher indefinitely.
+    Failure does not imply that retrying is safe: a paste may have arrived.
     """
     buffer_name = f"agentchattr-inject-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
@@ -99,7 +104,7 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     loaded = subprocess.run(
         ["tmux", "load-buffer", "-b", buffer_name, "-"],
         input=text.encode("utf-8"),
-        capture_output=True,
+        capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
     )
     if loaded.returncode != 0:
         print(f"  INJECT FAILED: load-buffer exit {loaded.returncode}: "
@@ -110,7 +115,7 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     # -p: bracket the paste if the pane asked for it; -d: drop the buffer after.
     pasted = subprocess.run(
         ["tmux", "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane],
-        capture_output=True,
+        capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
     )
     if pasted.returncode != 0:
         print(f"  INJECT FAILED: paste-buffer exit {pasted.returncode}: "
@@ -122,7 +127,7 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     time.sleep(max(delay, len(text) * 0.001))
     entered = subprocess.run(
         ["tmux", "send-keys", "-t", pane, "Enter"],
-        capture_output=True,
+        capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
     )
     if entered.returncode != 0:
         print(f"  INJECT FAILED: Enter exit {entered.returncode}: "
