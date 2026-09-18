@@ -1032,7 +1032,10 @@ def main():
             f"agentchattr-{_slug}-{assigned_name}" if _slug
             else f"agentchattr-{assigned_name}"
         )
-        _set_activity_checker(get_activity_checker(unix_session_name, trigger_flag=_trigger_flag))
+        _set_activity_checker(get_activity_checker(
+            unix_session_name, trigger_flag=_trigger_flag,
+            provider=_provider_from_command(command),
+        ))
 
     run_kwargs = dict(
         command=command,
