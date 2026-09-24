@@ -1,0 +1,25 @@
+# delegation-policy.yml - local-coder delegation dial for this fork (maxlamagna/agentchattr only).
+# Added 2026-09-24 (ai-dotfiles, Max #7618) so the ai-dotfiles local-coder runner can take a
+# delegated job in this repository: it refuses any repo that declares no seeded_test_kind.
+# Nothing in AgentChattr reads this file. The categories mirror ai-dotfiles' own policy; see
+# ai-dotfiles delegation-policy.yml for what each dial means.
+#
+# The one machine-read key besides the kind: seeded tests may live only under tests/.
+seeded_test_roots: [tests/]
+
+# Which contained executor grades this repo. Its seeds are bash files that drive the
+# standard-library modules (registry.py, agents.py, wrapper.py) with python3; the grading
+# container has no FastAPI, so app.py-level behaviour is verified by the reviewer on the host.
+seeded_test_kind: bash
+
+delegation_policy:
+  default: off
+  small_pure_logic_fix:  { enabled: true,  max_files: 8, max_qwen_iters: 5, require_seeded_test: true, review_loc_threshold: 400 }
+  small_create:          { enabled: true,  max_files: 8, max_qwen_iters: 5, require_seeded_test: true, review_loc_threshold: 400 }
+  test_seed_only:        { enabled: true,  max_files: 8, max_qwen_iters: 5, require_seeded_test: false, review_loc_threshold: 400 }
+  small_bounded_feature: { enabled: true,  max_files: 8, max_qwen_iters: 5, require_seeded_test: true, review_loc_threshold: 400 }
+  ui_exact_text:         { enabled: true,  max_files: 8, max_qwen_iters: 5, require_seeded_test: true, review_loc_threshold: 400 }
+  underspecified_work:   { enabled: false }
+  architectural_change:  { enabled: false }
+  dependency_change:     { enabled: false }
+  auth_security_payments_migrations_secrets_ci_infra: { enabled: false }
