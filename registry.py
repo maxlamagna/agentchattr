@@ -589,6 +589,23 @@ class RuntimeRegistry:
         with self._lock:
             return {n: _inst_dict(i) for n, i in self._instances.items()}
 
+    def resolve_identity(self, identity_id: str) -> dict | None:
+        """Map an identity_id to the current instance dict, or None if not live.
+
+        Name-independent lookup: a wake addressed by identity can follow an
+        instance through a rename and can never reach a recycled or reserved
+        name. A deregistered instance is not live even while its identity is
+        still recoverable in _reclaimable - reclaim is a reconnect path, not an
+        addressing target. Read-only: no notify, no persistence.
+        """
+        if not identity_id or not isinstance(identity_id, str):
+            return None
+        with self._lock:
+            for inst in self._instances.values():
+                if inst.identity_id == identity_id:
+                    return _inst_dict(inst)
+        return None
+
     def get_agent_config(self) -> dict[str, dict]:
         """For WebSocket 'agents' message: {name: {color, label, base, state}}."""
         with self._lock:

@@ -20,7 +20,7 @@ from summaries import SummaryStore
 from jobs import JobStore
 from schedules import ScheduleStore, parse_schedule_spec
 from router import Router
-from agents import AgentTrigger
+from agents import AgentTrigger, strict_wake_response
 from registry import RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
@@ -1916,6 +1916,19 @@ async def demote_rule_proposal(msg_id: int):
 async def trigger_agent_silent(request: Request):
     """Silently trigger an agent with a message (no chat message posted)."""
     body = await request.json()
+    # Strict identity mode: a body carrying an identity_id wakes exactly that
+    # instance and answers with the honest status code. It must be checked
+    # before the agent/message guard, which is name-based and would 400 a
+    # name-free wake.
+    if isinstance(body, dict) and "identity_id" in body:
+        result = agents.trigger_identity(
+            body.get("identity_id"),
+            body.get("prompt", ""),
+            message=body.get("message", "") or "",
+            channel=body.get("channel", "general") or "general",
+        )
+        code, payload = strict_wake_response(result, body.get("identity_id"))
+        return JSONResponse(payload, status_code=code)
     agent_name = body.get("agent", "").strip()
     message = body.get("message", "").strip()
     channel = body.get("channel", "general")

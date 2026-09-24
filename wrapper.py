@@ -472,9 +472,23 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
         pass
 
 
+def instance_wake_env(identity_id: str, server_port: int, name: str) -> dict[str, str]:
+    """Env vars that hand the wrapped CLI its own wake address.
+
+    The CLI can wake *itself* (and only itself) through the strict identity mode
+    of /api/trigger-agent without knowing its name - names get renamed, recycled
+    and family-expanded, an identity_id does not.
+    """
+    return {
+        "AGENTCHATTR_INSTANCE_IDENTITY": identity_id,
+        "AGENTCHATTR_INSTANCE_SERVER": f"http://127.0.0.1:{server_port}",
+        "AGENTCHATTR_INSTANCE_NAME": name,
+    }
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10, ready_flag=None):
+                   refresh_interval: int = 10, ready_flag=None, get_identity_id_fn=None):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
@@ -493,6 +507,33 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 with open(queue_file, "r", encoding="utf-8") as f:
                     lines = f.readlines()
                 queue_file.write_text("", "utf-8")
+
+                # Exact-instance wake: a line addressed to a different identity
+                # is not ours to act on. It is consumed (the file is already
+                # truncated) but dropped, so it cannot count as a trigger, set
+                # the channel, carry a job id or inject. A line with no
+                # identity_id is addressed by name, like every legacy queue
+                # entry, and is left exactly as it was.
+                own_identity = get_identity_id_fn() if get_identity_id_fn else ""
+                if isinstance(own_identity, str) and own_identity:
+                    kept = []
+                    for line in lines:
+                        addressee = ""
+                        stripped = line.strip()
+                        if stripped:
+                            try:
+                                data = json.loads(stripped)
+                            except json.JSONDecodeError:
+                                data = None
+                            if isinstance(data, dict):
+                                iid = data.get("identity_id")
+                                if isinstance(iid, str):
+                                    addressee = iid
+                        if addressee and addressee != own_identity:
+                            print(f"  WAKE DROPPED: queue line for identity {addressee[:8]}")
+                            continue
+                        kept.append(line)
+                    lines = kept
 
                 has_trigger = False
                 channel = "general"
@@ -729,6 +770,7 @@ def main():
         "name": assigned_name,
         "queue": data_dir / f"{assigned_name}_queue.jsonl",
         "token": assigned_token,
+        "identity_id": registration.get("identity_id", ""),
     }
 
     def get_identity():
@@ -738,6 +780,10 @@ def main():
     def get_token():
         with _identity_lock:
             return _identity["token"]
+
+    def get_identity_id():
+        with _identity_lock:
+            return _identity["identity_id"]
 
     # Ready-gate state (TD-006). _ready_flag is the release switch for mention
     # injection + heartbeats; _cli_proven_ready records that the pane passed
@@ -774,10 +820,12 @@ def main():
         except Exception:
             pass
 
-    def set_runtime_identity(new_name: str | None = None, new_token: str | None = None):
+    def set_runtime_identity(new_name: str | None = None, new_token: str | None = None,
+                             new_identity_id: str | None = None):
         with _identity_lock:
             old_name = _identity["name"]
             old_token = _identity["token"]
+            old_identity_id = _identity["identity_id"]
             changed = False
             if new_name and new_name != old_name:
                 _identity["name"] = new_name
@@ -785,6 +833,9 @@ def main():
                 changed = True
             if new_token and new_token != old_token:
                 _identity["token"] = new_token
+                changed = True
+            if new_identity_id and new_identity_id != old_identity_id:
+                _identity["identity_id"] = new_identity_id
                 changed = True
             current_name = _identity["name"]
             current_token = _identity["token"]
@@ -834,6 +885,11 @@ def main():
         mcp_cfg=mcp_cfg,
         project_dir=project_dir,
     )
+    # The CLI gets its own wake address so it can use the strict identity mode of
+    # /api/trigger-agent on itself. The name is the one this wrapper started with
+    # (the queue file it truncates), not a later rename.
+    inject_env.update(instance_wake_env(registration.get("identity_id", ""),
+                                        server_port, assigned_name))
 
     print(f"  === {assigned_name.capitalize()} Chat Wrapper ===")
     if not needs_proxy:
@@ -883,7 +939,8 @@ def main():
                     try:
                         replacement = _register_instance(server_port, agent, args.label,
                                                          ready_gate=args.ready_gate)
-                        set_runtime_identity(replacement["name"], replacement["token"])
+                        set_runtime_identity(replacement["name"], replacement["token"],
+                                             replacement.get("identity_id"))
                         # Ready gate (#3925.3): the replacement identity starts
                         # in `starting` and must not skip the gate. Hold the
                         # release; the loop-top retry re-asserts ready (the CLI
@@ -918,7 +975,8 @@ def main():
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                     "server_port": server_port, "agent_name": assigned_name,
                     "get_token_fn": get_token, "refresh_interval": _refresh_interval,
-                    "ready_flag": _ready_flag if ready_gate_cfg else None},
+                    "ready_flag": _ready_flag if ready_gate_cfg else None,
+                    "get_identity_id_fn": get_identity_id},
             daemon=True,
         )
         _watcher_thread.start()
@@ -936,7 +994,8 @@ def main():
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                             "server_port": server_port, "agent_name": assigned_name,
                             "get_token_fn": get_token, "refresh_interval": _refresh_interval,
-                            "ready_flag": _ready_flag if ready_gate_cfg else None},
+                            "ready_flag": _ready_flag if ready_gate_cfg else None,
+                            "get_identity_id_fn": get_identity_id},
                     daemon=True,
                 )
                 _watcher_thread.start()
