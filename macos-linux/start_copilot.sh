@@ -2,7 +2,7 @@
 # agentchattr - starts server (if not running) + GitHub Copilot CLI wrapper
 # Usage: sh start_copilot.sh
 # Requires the copilot CLI on PATH. First launch prompts GitHub login.
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then

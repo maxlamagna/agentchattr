@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # agentchattr - starts server (if not running) + Antigravity (agy) wrapper
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 # Pin agy's version - it self-updates and will otherwise drift out from under you
 export AGY_CLI_DISABLE_AUTO_UPDATE=1

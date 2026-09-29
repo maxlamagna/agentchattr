@@ -2,7 +2,7 @@
 # agentchattr — starts server (if not running) + MiniMax API agent wrapper
 # Usage: sh start_minimax.sh
 # Requires MINIMAX_API_KEY environment variable.
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then

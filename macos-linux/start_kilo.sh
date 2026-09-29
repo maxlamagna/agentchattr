@@ -3,7 +3,7 @@
 # Usage: sh start_kilo.sh [provider/model]
 #   e.g. sh start_kilo.sh anthropic/claude-sonnet-4-20250514
 #   Omit the model to use Kilo's configured default.
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then

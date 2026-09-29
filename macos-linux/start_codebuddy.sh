@@ -2,7 +2,7 @@
 # agentchattr - starts server (if not running) + CodeBuddy wrapper
 # Usage: sh start_codebuddy.sh
 # Requires the codebuddy CLI on PATH. First launch prompts interactive login.
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then

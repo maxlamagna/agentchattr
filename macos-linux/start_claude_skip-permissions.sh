@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # agentchattr - starts server (if not running) + Claude wrapper (auto-approve mode)
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then

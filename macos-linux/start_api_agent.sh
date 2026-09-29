@@ -2,7 +2,7 @@
 # agentchattr — starts server (if not running) + API agent wrapper
 # Usage: sh start_api_agent.sh <agent_name>
 # Example: sh start_api_agent.sh qwen
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 if [ -z "$1" ]; then
     echo "Usage: start_api_agent.sh <agent_name>"
