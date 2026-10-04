@@ -27,7 +27,8 @@
 #
 # display-message -p -t NAME answers a live session with its pane id and exits
 # 1 when the session flag is gone, so an injection aimed at a dead CLI aborts
-# before it can reach the paste.
+# before it can reach the paste. The '#{pane_in_mode}' query reads 0 (no tmux
+# mode) while any session lives.
 
 set -u
 
@@ -85,6 +86,15 @@ case "$cmd" in
         exit 0
         ;;
     display-message)
+        # The inject's mode query targets the pane id, not the session: the
+        # scripted pane is never in a tmux mode, so it reads 0 while a session lives.
+        case " $* " in
+            *' #{pane_in_mode} '*)
+                ls "$FAKE_TMUX_DIR"/session.* >/dev/null 2>&1 || exit 1
+                printf '%s\n' '0'
+                exit 0
+                ;;
+        esac
         # A dead session answers nothing; the wrapper's pane lookup fails and
         # the injection aborts before it can load or paste anything.
         [ -f "$flag" ] || exit 1

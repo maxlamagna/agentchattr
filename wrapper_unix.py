@@ -7,8 +7,9 @@ Called by wrapper.py on Mac and Linux. Requires tmux to be installed.
 How it works:
   1. Creates a tmux session running the agent CLI
   2. Queue watcher delivers the prompt as one bracketed paste
-     ('tmux load-buffer' + 'tmux paste-buffer -p'), then presses Enter; a pane
-     scrolled into copy mode is cancelled first, or the mode would eat the Enter
+     ('tmux load-buffer' + 'tmux paste-buffer -p'), then presses Enter; any tmux
+     mode the pane is in (copy mode after a scroll, a tree or buffer picker) is
+     left first with 'copy-mode -q', or the mode would eat the Enter
   3. Wrapper attaches to the session so you see the full TUI
   4. Ctrl+B, D to detach (agent keeps running in background)
 """
@@ -57,28 +58,37 @@ def _pane_id(tmux_session: str) -> str | None:
     return pane or None
 
 
-def _pane_in_mode(pane: str) -> bool:
-    """True when the pane is in a tmux mode, such as copy mode after a mouse scroll.
+def _pane_mode_count(pane: str) -> int | None:
+    """How many tmux modes the pane is in (0 = none), or None when that cannot be read.
 
     In a mode, tmux keeps `send-keys` for the mode itself while `paste-buffer` still writes
     to the program: the prompt lands in the CLI's input but its Enter is swallowed, so it
     sits unsubmitted until the next injection is glued onto it. Measured 2026-10-03/04: two
     local-coder wakes waited 9.5 h in Claude Code's input, then arrived as ONE joined prompt.
+    Modes stack (choose-tree, then a scroll into copy mode, reads 2), so this is a count.
     """
     result = subprocess.run(
         ["tmux", "display-message", "-p", "-t", pane, "#{pane_in_mode}"],
         capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
     )
-    return result.returncode == 0 and result.stdout.decode(errors="replace").strip() == "1"
+    answer = result.stdout.decode(errors="replace").strip()
+    if result.returncode != 0 or not answer.isdigit():
+        return None
+    return int(answer)
 
 
 def _leave_mode(pane: str) -> bool:
-    """Leave any tmux mode the pane is in; False if it is still in one afterwards."""
-    if not _pane_in_mode(pane):
+    """Leave every tmux mode the pane is in; True only when it is provably in none.
+
+    `copy-mode -q` cancels all modes (copy, view, tree, buffer, and stacked ones), where
+    `send-keys -X cancel` leaves tree and buffer mode in place. A count that cannot be read
+    is not taken as safe.
+    """
+    if _pane_mode_count(pane) == 0:
         return True
-    subprocess.run(["tmux", "send-keys", "-t", pane, "-X", "cancel"],
+    subprocess.run(["tmux", "copy-mode", "-q", "-t", pane],
                    capture_output=True, timeout=TMUX_COMMAND_TIMEOUT)
-    return not _pane_in_mode(pane)
+    return _pane_mode_count(pane) == 0
 
 
 def _drop_buffer(name: str) -> None:
@@ -129,7 +139,8 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     # A scrolled pane (copy mode) would swallow the Enter below; leave the mode first, and
     # paste nothing if the pane will not leave it, so a later retry cannot double the prompt.
     if not _leave_mode(pane):
-        print(f"  INJECT FAILED: pane {pane} is in a tmux mode that did not cancel; nothing pasted")
+        print(f"  INJECT FAILED: pane {pane} did not leave its tmux mode (or the mode is "
+              f"unreadable); nothing pasted")
         return False
 
     loaded = subprocess.run(
@@ -158,7 +169,8 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     time.sleep(max(delay, len(text) * 0.001))
     # A scroll during that pause would put the pane back in copy mode and eat the Enter.
     if not _leave_mode(pane):
-        print(f"  INJECT FAILED: pane {pane} entered a tmux mode after the paste; Enter not sent")
+        print(f"  INJECT FAILED: pane {pane} is in a tmux mode it did not leave (or the mode is "
+              f"unreadable) after the paste; Enter not sent")
         return False
     entered = subprocess.run(
         ["tmux", "send-keys", "-t", pane, "Enter"],

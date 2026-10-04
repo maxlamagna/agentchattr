@@ -161,18 +161,33 @@ class InjectTransportTests(unittest.TestCase):
         the CLI's input unsubmitted, and the next injection is glued onto it. Measured
         2026-10-03/04: two local-coder wakes sat unsubmitted for 9.5 h, then arrived as one
         concatenated prompt. inject() must leave the mode before it pastes."""
+        self._assert_delivered_through_modes([["copy-mode"]], "1")
+
+    def test_tree_mode_pane_is_cleared_then_receives_paste_then_enter(self):
+        """`send-keys -X cancel` leaves tree mode (choose-tree) in place (Codex #7980)."""
+        self._assert_delivered_through_modes([["choose-tree"]], "1")
+
+    def test_stacked_modes_are_all_cleared_then_receive_paste_then_enter(self):
+        """Modes stack: choose-tree, then a scroll into copy mode, reads pane_in_mode=2
+        (Codex #7980). Every mode must be left, not only the top one."""
+        self._assert_delivered_through_modes([["choose-tree"], ["copy-mode"]], "2")
+
+    def _assert_delivered_through_modes(self, mode_commands, expected_count):
         payload = "local-coder job lnw-test terminated with runner rc=0"
 
-        def enter_copy_mode(session):
-            subprocess.run(["tmux", "copy-mode", "-t", session], capture_output=True)
+        def enter_modes(session):
+            for command in mode_commands:
+                subprocess.run(["tmux"] + command + ["-t", session], capture_output=True)
             mode = subprocess.run(["tmux", "display-message", "-p", "-t", session,
                                    "#{pane_in_mode}"], capture_output=True, text=True)
-            self.assertEqual(mode.stdout.strip(), "1", "fixture: the pane must start in copy mode")
+            self.assertEqual(mode.stdout.strip(), expected_count,
+                             f"fixture: the pane must start in {mode_commands}")
 
-        ok, data, sizes = self._run("bracketed", payload, pre_inject=enter_copy_mode,
+        ok, data, sizes = self._run("bracketed", payload, pre_inject=enter_modes,
                                     done_timeout=10)
         self.assertEqual(data, OPEN + payload.encode("utf-8") + CLOSE + b"\r",
-                         f"a copy-mode pane must still get one framed paste then Enter; reads={sizes}")
+                         f"a pane in {mode_commands} must still get one framed paste then Enter; "
+                         f"reads={sizes}")
         self.assertIs(ok, True, "inject must report delivery")
 
     def test_missing_target_returns_false_and_leaves_no_buffer(self):
@@ -195,7 +210,8 @@ class InjectFailurePathTests(unittest.TestCase):
             calls.append(argv)
             verb = argv[1]
             if verb == "display-message":
-                return subprocess.CompletedProcess(argv, 0, stdout=b"%7\n", stderr=b"")
+                out = b"0\n" if "#{pane_in_mode}" in argv else b"%7\n"
+                return subprocess.CompletedProcess(argv, 0, stdout=out, stderr=b"")
             if verb == "paste-buffer":
                 return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"can't find pane\n")
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
@@ -221,7 +237,8 @@ class InjectFailurePathTests(unittest.TestCase):
             calls.append(argv)
             verb = argv[1]
             if verb == "display-message":
-                return subprocess.CompletedProcess(argv, 0, stdout=b"%7\n", stderr=b"")
+                out = b"0\n" if "#{pane_in_mode}" in argv else b"%7\n"
+                return subprocess.CompletedProcess(argv, 0, stdout=out, stderr=b"")
             if verb == "paste-buffer":
                 raise OSError("tmux vanished")
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
