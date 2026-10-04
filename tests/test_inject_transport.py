@@ -105,7 +105,8 @@ def _wait_for(path: str, marker: bytes, timeout: float) -> bool:
 class InjectTransportTests(unittest.TestCase):
     """Real tmux, real pty, raw-mode reader pane."""
 
-    def _run(self, mode: str, payload: str, delay: float = 1.0):
+    def _run(self, mode: str, payload: str, delay: float = 1.0, pre_inject=None,
+             done_timeout: float = 45):
         session = f"agentchattr-test-inject-{os.getpid()}-{mode}"
         tmp = tempfile.mkdtemp(prefix="agentchattr-inject-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -125,10 +126,12 @@ class InjectTransportTests(unittest.TestCase):
                         capture_output=True)
         self.assertTrue(_wait_for(reads, b"READY", 10), "reader pane never became ready")
         time.sleep(0.3)                    # let tmux parse the DECSET before pasting
+        if pre_inject is not None:
+            pre_inject(session)
 
         ok = wrapper_unix.inject(payload, tmux_session=session, delay=0.1)
 
-        self.assertTrue(_wait_for(reads, b"DONE", 45), "reader never saw Enter")
+        self.assertTrue(_wait_for(reads, b"DONE", done_timeout), "reader never saw Enter")
         with open(stream, "rb") as f:
             data = f.read()
         with open(reads, "r") as f:
@@ -150,6 +153,26 @@ class InjectTransportTests(unittest.TestCase):
         self.assertNotIn(OPEN, data, "no delimiters when the app never asked for them")
         self.assertEqual(data, payload.encode("utf-8") + b"\r",
                          f"plain pane must get the raw bytes then Enter; reads={sizes}")
+        self.assertIs(ok, True, "inject must report delivery")
+
+    def test_copy_mode_pane_is_cancelled_then_receives_paste_then_enter(self):
+        """A pane in tmux copy mode (mouse on, then a scroll over it) still passes a paste to the
+        program but keeps send-keys for the mode, so the Enter is swallowed: the prompt sits in
+        the CLI's input unsubmitted, and the next injection is glued onto it. Measured
+        2026-10-03/04: two local-coder wakes sat unsubmitted for 9.5 h, then arrived as one
+        concatenated prompt. inject() must leave the mode before it pastes."""
+        payload = "local-coder job lnw-test terminated with runner rc=0"
+
+        def enter_copy_mode(session):
+            subprocess.run(["tmux", "copy-mode", "-t", session], capture_output=True)
+            mode = subprocess.run(["tmux", "display-message", "-p", "-t", session,
+                                   "#{pane_in_mode}"], capture_output=True, text=True)
+            self.assertEqual(mode.stdout.strip(), "1", "fixture: the pane must start in copy mode")
+
+        ok, data, sizes = self._run("bracketed", payload, pre_inject=enter_copy_mode,
+                                    done_timeout=10)
+        self.assertEqual(data, OPEN + payload.encode("utf-8") + CLOSE + b"\r",
+                         f"a copy-mode pane must still get one framed paste then Enter; reads={sizes}")
         self.assertIs(ok, True, "inject must report delivery")
 
     def test_missing_target_returns_false_and_leaves_no_buffer(self):
