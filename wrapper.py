@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from queue_io import read_batch, begin_batch, finish_batch
 
 ROOT = Path(__file__).parent
 
@@ -493,24 +494,37 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
     trigger_count = 0
+    pending = []
+    pending_file = None
+    attempts = 0
+    disposition = ''
+    pending_prompt = ''
+    prompt_key = None
     while True:
         try:
             # Ready gate (TD-006, #3925.2): while the gate is held the watcher
-            # must not READ, CLEAR, or inject - reading here truncates the
-            # queue file, so an inject-only gate would silently erase mentions
-            # that arrive during a CLI restart.
+            # must not READ, acknowledge, or inject mentions during a CLI restart.
             if ready_flag is not None and not ready_flag[0]:
                 time.sleep(1)
                 continue
-            _, queue_file = get_identity_fn()
-            if queue_file.exists() and queue_file.stat().st_size > 0:
-                with open(queue_file, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                queue_file.write_text("", "utf-8")
+            if not pending:
+                _, pending_file = get_identity_fn()
+                pending = read_batch(pending_file)
+                attempts = 0
+                disposition = ''
+                pending_prompt = ''
+                prompt_key = None
+            if pending:
+                # A failed acknowledgement after a paste must never paste again.
+                if disposition:
+                    finish_batch(pending_file, pending, disposition, attempts)
+                    pending = []
+                    continue
+                lines = pending
 
                 # Exact-instance wake: a line addressed to a different identity
-                # is not ours to act on. It is consumed (the file is already
-                # truncated) but dropped, so it cannot count as a trigger, set
+                # is not ours to act on. It is acknowledged without injection,
+                # so it cannot count as a trigger, set
                 # the channel, carry a job id or inject. A line with no
                 # identity_id is addressed by name, like every legacy queue
                 # entry, and is left exactly as it was.
@@ -535,8 +549,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         kept.append(line)
                     lines = kept
 
-                has_trigger = False
-                channel = "general"
+                prompts = []
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -545,40 +558,26 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    has_trigger = True
-                    if isinstance(data, dict) and "channel" in data:
-                        channel = data["channel"]
+                    if not isinstance(data, dict):
+                        continue
+                    custom = data.get('prompt', '')
+                    if isinstance(custom, str) and custom.strip():
+                        task = custom.strip()
+                    elif data.get('job_id'):
+                        task = f"use mcp to read job_id={data['job_id']} - you're mentioned in a job thread, take appropriate action and respond"
+                    else:
+                        channel = data.get('channel') or 'general'
+                        task = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
+                    if task not in prompts:
+                        prompts.append(task)
 
-                if has_trigger:
+                if prompts:
                     # Signal activity BEFORE injecting — covers the thinking phase
                     if trigger_flag is not None:
                         trigger_flag[0] = True
                     time.sleep(0.5)
 
-                    # Check if this is a job/activity-scoped trigger
-                    job_id = None
-                    custom_prompt = ""
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                            if isinstance(data, dict) and "job_id" in data:
-                                job_id = data["job_id"]
-                            if isinstance(data, dict):
-                                raw_prompt = data.get("prompt", "")
-                                if isinstance(raw_prompt, str) and raw_prompt.strip():
-                                    custom_prompt = raw_prompt.strip()
-                        except json.JSONDecodeError:
-                            pass
-
-                    if custom_prompt:
-                        prompt = custom_prompt
-                    elif job_id:
-                        prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
-                    else:
-                        prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
+                    prompt = '\n\n'.join(prompts)
 
                     # Use current identity (may have changed via rename)
                     current_name, _ = get_identity_fn()
@@ -614,7 +613,28 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # Flatten to single line — multi-line text triggers paste
                     # detection in CLIs (Claude Code shows "[Pasted text +N]")
                     # which can break injection of long session prompts
-                    inject_fn(prompt.replace("\n", " "))
+                    attempts += 1
+                    key = (own_identity, tuple(prompts))
+                    if key != prompt_key:
+                        pending_prompt = prompt.replace("\n", " ")
+                        prompt_key = key
+                    begin_batch(pending_file, pending, attempts)
+                    try:
+                        result = inject_fn(pending_prompt)
+                    except Exception:
+                        result = None  # an exception does not prove nothing was pasted
+                    if result is False and attempts < 3:
+                        if finish_batch(pending_file, pending, 'not-pasted', attempts, consume=False) is False:
+                            pending = []  # another consumer replaced/acknowledged this batch
+                    else:
+                        disposition = ('delivered' if result is True else
+                                       'not-pasted-exhausted' if result is False else 'uncertain')
+                        finish_batch(pending_file, pending, disposition, attempts)
+                        pending = []
+                else:
+                    disposition = 'ignored'
+                    finish_batch(pending_file, pending, disposition, attempts)
+                    pending = []
         except Exception:
             pass
 

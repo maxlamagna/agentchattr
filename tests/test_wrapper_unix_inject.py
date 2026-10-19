@@ -37,7 +37,7 @@ class InjectTimeoutTests(unittest.TestCase):
                         ok = wrapper_unix.inject('short test', tmux_session='test', delay=0)
                         elapsed = time.monotonic() - start
                     verbs = calls.read_text().splitlines()
-                    self.assertIs(ok, False)
+                    self.assertIs(ok, False if stalled in ('display-message', 'load-buffer') else None)
                     self.assertLess(elapsed, 3, 'a child-process hang must be bounded')
                     self.assertLessEqual(verbs.count('paste-buffer'), 1, 'do not retry a possibly delivered paste')
                     self.assertLessEqual(verbs.count('send-keys'), 1, 'do not repeat Enter')

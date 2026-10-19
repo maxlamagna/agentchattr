@@ -96,7 +96,7 @@ def _drop_buffer(name: str) -> None:
                    capture_output=True, timeout=TMUX_COMMAND_TIMEOUT)
 
 
-def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool:
+def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool | None:
     """Deliver text to the agent CLI as ONE bracketed paste, then press Enter.
 
     Why a paste and not send-keys: a pty's raw input queue is finite (1024
@@ -112,24 +112,26 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool:
     Returns True only when tmux accepted both the paste and Enter. On any
     failure, a non-zero exit, timeout or an exception launching tmux, it prints a
     diagnostic, cleans up its buffer on a best-effort basis, sends nothing
-    further, and returns False (the queue watcher swallows exceptions, so a
-    raise alone would be invisible). Each delivery and cleanup command has a
+    further. False proves that the paste process never started; None means
+    a paste may have arrived and MUST NOT be retried. Each delivery and cleanup command has a
     time limit so a stuck tmux cannot block the queue watcher indefinitely.
     Failure does not imply that retrying is safe: a paste may have arrived.
     """
     buffer_name = f"agentchattr-inject-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    paste_attempted = [False]
     try:
-        return _deliver(text, tmux_session, buffer_name, delay)
+        return _deliver(text, tmux_session, buffer_name, delay, paste_attempted)
     except Exception as exc:  # launching tmux itself failed, not a non-zero exit
         print(f"  INJECT FAILED: {type(exc).__name__}: {exc}")
         try:
             _drop_buffer(buffer_name)
         except Exception:
             pass
-        return False
+        return None if paste_attempted[0] else False
 
 
-def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bool:
+def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float,
+             paste_attempted: list[bool]) -> bool | None:
     """The paste-then-Enter sequence; every tmux exit status is checked."""
     pane = _pane_id(tmux_session)
     if pane is None:
@@ -155,15 +157,20 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
         return False
 
     # -p: bracket the paste if the pane asked for it; -d: drop the buffer after.
-    pasted = subprocess.run(
-        ["tmux", "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane],
-        capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
-    )
+    paste_attempted[0] = True
+    try:
+        pasted = subprocess.run(
+            ["tmux", "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane],
+            capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
+        )
+    except OSError:  # failed to start tmux; a timeout remains potentially pasted
+        paste_attempted[0] = False
+        raise
     if pasted.returncode != 0:
         print(f"  INJECT FAILED: paste-buffer exit {pasted.returncode}: "
               f"{pasted.stderr.decode(errors='replace').strip()}")
         _drop_buffer(buffer_name)
-        return False
+        return None
 
     # Scale delay with text length so longer prompts get more processing time
     time.sleep(max(delay, len(text) * 0.001))
@@ -171,7 +178,7 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     if not _leave_mode(pane):
         print(f"  INJECT FAILED: pane {pane} is in a tmux mode it did not leave (or the mode is "
               f"unreadable) after the paste; Enter not sent")
-        return False
+        return None
     entered = subprocess.run(
         ["tmux", "send-keys", "-t", pane, "Enter"],
         capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
@@ -179,7 +186,7 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float) -> bo
     if entered.returncode != 0:
         print(f"  INJECT FAILED: Enter exit {entered.returncode}: "
               f"{entered.stderr.decode(errors='replace').strip()}")
-        return False
+        return None
     return True
 
 

@@ -1,9 +1,9 @@
 """Agent trigger — writes to queue files picked up by visible worker terminals."""
 
-import json
 import logging
 import re
 from pathlib import Path
+from queue_io import append_entry
 
 log = logging.getLogger(__name__)
 
@@ -101,8 +101,7 @@ class AgentTrigger:
         if job_id is not None:
             entry["job_id"] = job_id
 
-        with open(queue_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_entry(queue_file, entry)
 
         log.info("Queued @%s trigger (ch=%s, job=%s): %s", agent_name, channel, job_id, message[:80])
         return True
@@ -131,8 +130,7 @@ class AgentTrigger:
         if job_id is not None:
             entry["job_id"] = job_id
 
-        with open(queue_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_entry(queue_file, entry)
 
         log.info("Queued @%s trigger (ch=%s, job=%s): %s", agent_name, channel, job_id, message[:80])
         return True
@@ -179,8 +177,7 @@ class AgentTrigger:
             "identity_id": identity_id,
         }
 
-        with open(queue_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_entry(queue_file, entry)
 
         log.info("Queued identity wake %s -> @%s (ch=%s)", identity_id[:8], name, channel)
         return {"status": "queued", "target": name}
