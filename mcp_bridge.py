@@ -345,7 +345,11 @@ def chat_send(
     msg = store.add(sender, message.strip(), attachments=attachments,
                     reply_to=reply_id, channel=channel,
                     msg_type=msg_type, metadata=metadata)
-    _update_cursor(sender, [msg], channel)
+    # TD-182: an own send may only move a cursor over the message it just
+    # posted, and only when nothing unread sits in front of it (see
+    # _advance_over_own_send). Anything posted since the sender's last read
+    # stays unread and comes back on the next chat_read.
+    _advance_over_own_send(sender, msg, channel)
     with _presence_lock:
         _presence[sender] = time.time()
     return f"Sent (id={msg['id']})"
@@ -381,7 +385,8 @@ def chat_propose_job(
         channel=channel,
         metadata={"title": title, "body": body, "status": "pending"},
     )
-    _update_cursor(sender, [msg], channel)
+    # TD-182: an own send never skips unread messages (see chat_send).
+    _advance_over_own_send(sender, msg, channel)
     with _presence_lock:
         _presence[sender] = time.time()
     return f"Proposed job (msg_id={msg['id']}): {title}"
@@ -406,7 +411,48 @@ def _resolve_attachments(attachments: list[dict]) -> list[dict]:
     return resolved
 
 
-def _serialize_messages(msgs: list[dict]) -> str:
+def _read_more_entry(msgs: list[dict], dropped: int, channel: str | None,
+                     limit: int, cursor_ahead: bool) -> list[dict]:
+    """Trailing entry for a paged read that stopped at `limit` with more ahead.
+
+    TD-182: a paged backlog is delivered oldest-first, so what is past `limit`
+    is newer and still ahead of the reader. Emitted only when messages were
+    actually left behind; it is one more entry in the same JSON array, so a
+    caller that does not look for type "read_more" parses the response exactly
+    as before.
+
+    `cursor_ahead` says the cursor already sits past the last message returned,
+    which is what an explicit since_id below the reader's own cursor does: an
+    ordinary read would resume at that cursor and skip what is left of this
+    page, so the hint names the exact call that re-reads the page and what it
+    resumes from. With the cursor right behind the page the next ordinary read
+    continues on its own and the hint only says to call chat_read again.
+    """
+    if dropped <= 0 or not msgs:
+        return []
+    last = msgs[-1]
+    if cursor_ahead:
+        text = f"{dropped} newer messages not shown - call chat_read("
+        text += f"since_id={last['id']}, limit={limit}) for the next page."
+    else:
+        text = f"{dropped} newer unread messages not shown - " \
+               f"call chat_read again for the next page."
+    entry = {
+        "id": last["id"],
+        "sender": "system",
+        "text": text,
+        "type": "read_more",
+        "time": "",
+        "channel": channel or "",
+        "remaining": dropped,
+    }
+    if cursor_ahead:
+        entry["since_id"] = last["id"]
+        entry["limit"] = limit
+    return [entry]
+
+
+def _serialize_messages(msgs: list[dict], trailing: list[dict] | None = None) -> str:
     """Serialize store messages into MCP chat_read output shape."""
     out = []
     for m in msgs:
@@ -423,6 +469,7 @@ def _serialize_messages(msgs: list[dict]) -> str:
         if m.get("reply_to") is not None:
             entry["reply_to"] = m["reply_to"]
         out.append(entry)
+    out.extend(trailing or [])
     return json.dumps(out, ensure_ascii=False) if out else ""
 
 
@@ -579,12 +626,81 @@ def migrate_cursors_delete(channel: str):
 
 
 def _update_cursor(sender: str, msgs: list[dict], channel: str | None):
+    """Advance one channel cursor of one sender, forward only.
+
+    TD-182: a cursor is monotonic. A read that starts from an older point (an
+    explicit since_id, a backlog paged below the cursor) can no longer drag a
+    cursor backwards and re-deliver what the sender already consumed. Compare
+    and write happen under one lock, so concurrent readers of the same sender
+    cannot lose an advance. Returns the position the cursor holds afterwards.
+    A key that holds no value yet is not a position of 0: it reads as -1, below
+    the first id, so a cursor that legitimately sits on id 0 is still recorded.
+
+    chat_resync is the one caller that may move a cursor backwards, and it uses
+    _reset_cursor for that: its documented contract is a reset, and it is how a
+    reader recovers when message ids sit below a persisted cursor.
+    """
+    if not (sender and msgs):
+        return None
+    ch_key = channel if channel else "__all__"
+    new_id = msgs[-1]["id"]
+    with _cursors_lock:
+        agent_cursors = _cursors.setdefault(sender, {})
+        current = agent_cursors.get(ch_key, -1)
+        if new_id <= current:
+            return current
+        agent_cursors[ch_key] = new_id
+    # _save_cursors() re-acquires _cursors_lock: keep it outside the block.
+    _save_cursors()
+    return new_id
+
+
+def _reset_cursor(sender: str, msgs: list[dict], channel: str | None):
+    """Set one cursor to the latest returned id, backwards included (chat_resync)."""
     if sender and msgs:
         ch_key = channel if channel else "__all__"
         with _cursors_lock:
-            agent_cursors = _cursors.setdefault(sender, {})
-            agent_cursors[ch_key] = msgs[-1]["id"]
+            _cursors.setdefault(sender, {})[ch_key] = msgs[-1]["id"]
         _save_cursors()
+
+
+def _advance_over_own_send(sender: str, msg: dict, channel: str | None):
+    """Move a sender's cursors over its own new message - over that message only.
+
+    TD-182: HEAD set the cursor to the sender's own message on every send, so a
+    message posted between that sender's last read and its own reply was skipped
+    for good. Advancing is still worth doing when the cursor already sits at the
+    newest thing in the key, because then only the sender's own message lies
+    between the cursor and itself: otherwise every agent's next read re-delivers
+    the message it just wrote. When anything unread precedes it the cursor stays
+    put and the next read returns the missed messages plus this one.
+
+    Safe against concurrent sends and reads: MessageStore assigns an id and
+    appends the message under one lock, so any message with a lower id than this
+    one is already in the list the snapshot below reads, and anything posted
+    afterwards has a higher id and stays ahead of the cursor. The write itself
+    goes through _update_cursor, forward-only under _cursors_lock, so a cursor a
+    concurrent read already advanced is never pulled back.
+
+    A key that holds no value reads as -1, below the first id, not as a
+    position of 0: an agent that was never handed message 0 has nothing
+    recorded, and a send of its own must not mark id 0 read on its behalf.
+    """
+    if not (sender and store and msg):
+        return
+    ch = channel if channel else None
+    keys = ["__all__"] + ([ch] if ch else [])
+    mid = msg["id"]
+    with _cursors_lock:
+        agent_cursors = _cursors.setdefault(sender, {})
+        floors = {k: agent_cursors.get(k, -1) for k in keys}
+    ahead = [m for m in store.get_since(min(floors.values())) if m["id"] != mid]
+    for key, floor in floors.items():
+        window = ahead if key == "__all__" else [
+            m for m in ahead if m.get("channel", "general") == key]
+        if any(m["id"] > floor for m in window):
+            continue
+        _update_cursor(sender, [{"id": mid}], None if key == "__all__" else key)
 
 
 def chat_read(
@@ -600,8 +716,15 @@ def chat_read(
     Smart defaults:
     - First call with sender: returns last `limit` messages (full context).
     - Subsequent calls with same sender: returns only NEW messages since last read.
-    - Pass since_id to override and read from a specific point.
-    - Omit sender to always get the last `limit` messages (no cursor).
+    - Pass since_id to override and read from a specific point. It never moves
+      the cursor backwards: read cursors are monotonic (see _update_cursor).
+    - A read that starts from a position in the log - the sender's cursor or a
+      since_id - is paged oldest-first: at most `limit` messages from that
+      point, and while messages are still ahead the last entry of the array is
+      {"type": "read_more", "remaining": N}. Following what that entry says
+      delivers the next page; nothing in between is skipped.
+    - Omit sender to always get the last `limit` messages (no cursor, no
+      paging: there is no position to continue from).
     - Pass channel to filter by channel name (default: all channels).
     - Pass job_id to read a specific job. Job reads return a header entry first,
       including title and body, followed by the thread messages."""
@@ -660,23 +783,41 @@ def chat_read(
         with _last_read_lock:
             _last_read_channel[sender] = ch
             _last_read_job_id.pop(sender, None)
+    # `paged` marks a read that starts from a position in the log (the sender's
+    # cursor, or an explicit since_id): it walks forward from that position
+    # instead of jumping to the newest window. A read with no sender has no
+    # cursor to advance, so it is never paged.
+    paged = False
     if since_id:
         msgs = store.get_since(since_id, channel=ch)
+        paged = bool(sender)
     elif sender:
         ch_key = ch if ch else "__all__"
         with _cursors_lock:
             agent_cursors = _cursors.get(sender, {})
-            cursor = agent_cursors.get(ch_key, 0)
-        if cursor:
+            cursor = agent_cursors.get(ch_key)
+        if cursor is not None:
             msgs = store.get_since(cursor, channel=ch)
+            paged = True
         else:
             msgs = store.get_recent(limit, channel=ch)
     else:
         msgs = store.get_recent(limit, channel=ch)
 
-    msgs = msgs[-limit:]
-    _update_cursor(sender, msgs, ch)
-    serialized = _serialize_messages(msgs)
+    # TD-182: a paged backlog bigger than `limit` is delivered oldest-first.
+    # Cutting it to the newest `limit` here moved the cursor past the oldest
+    # unread messages, which then never reached the reader again.
+    dropped = 0
+    if paged and limit and limit > 0 and len(msgs) > limit:
+        dropped = len(msgs) - limit
+        msgs = msgs[:limit]
+    else:
+        msgs = msgs[-limit:]
+    pos = _update_cursor(sender, msgs, ch)
+    last_id = msgs[-1]["id"] if msgs else -1
+    trailing = _read_more_entry(msgs, dropped, ch, limit,
+                                cursor_ahead=dropped > 0 and pos is not None and pos > last_id)
+    serialized = _serialize_messages(msgs, trailing)
 
     # Escalating empty-read hints to discourage polling loops
     if not serialized and sender:
@@ -721,7 +862,9 @@ def chat_resync(
         return err
     ch = channel if channel else None
     msgs = store.get_recent(limit, channel=ch)
-    _update_cursor(sender, msgs, ch)
+    # The established resync contract: reset to the latest returned id, which is
+    # also how a reader recovers when ids sit below a persisted cursor (F3).
+    _reset_cursor(sender, msgs, ch)
     serialized = _serialize_messages(msgs)
     return serialized
 

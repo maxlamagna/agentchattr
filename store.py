@@ -13,6 +13,9 @@ class MessageStore:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._todos_path = self._path.parent / "todos.json"
+        # Max #9392: ids must never be reissued, so the next id outlives the
+        # messages it was handed out for. Kept beside the log, never in it.
+        self._ids_path = self._path.parent / "message_ids.json"
         self._messages: list[dict] = []
         self._next_id: int = 0  # monotonically increasing, survives deletions
         self._todos: dict[int, str] = {}  # msg_id → "todo" | "done"
@@ -43,7 +46,36 @@ class MessageStore:
                     self._messages.append(msg)
                 except json.JSONDecodeError:
                     continue
-        self._next_id = max_id + 1
+        # The file is authoritative for every id still in it; the sidecar covers
+        # ids whose messages were deleted. max() also means a crash between the
+        # two writes can only ever skip an id, never reissue one.
+        self._next_id = max(max_id + 1, self._load_id_state())
+
+    def _load_id_state(self) -> int:
+        """Next id recorded beside the log; 0 when absent, empty or unusable."""
+        try:
+            raw = json.loads(self._ids_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return 0
+        value = raw.get("next_id") if isinstance(raw, dict) else None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return 0
+        return value
+
+    def _save_id_state(self):
+        """Record the next id so deleting a message never frees its id for reuse.
+
+        Written before the log is rewritten from memory: a crash between the two
+        leaves the recorded id ahead of the file, which costs a gap, never a
+        reissue. A failed write only returns to the pre-#9392 behaviour (the log
+        is still read on load), never to a lost message.
+        """
+        try:
+            tmp = self._ids_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"next_id": self._next_id}), "utf-8")
+            os.replace(tmp, self._ids_path)
+        except OSError:
+            pass
 
     def on_message(self, callback):
         """Register a callback(msg) called whenever a message is added."""
@@ -77,6 +109,9 @@ class MessageStore:
             self._next_id += 1
             self._messages.append(msg)
             if not _bulk:
+                # The next id is committed before the log line, so a crash here
+                # costs a gap and never hands an announced id out twice (#9392).
+                self._save_id_state()
                 with open(self._path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(msg, ensure_ascii=False) + "\n")
                     f.flush()
@@ -108,6 +143,7 @@ class MessageStore:
 
     def _rewrite(self):
         """Rewrite the full JSONL file from memory (used after bulk edits)."""
+        self._save_id_state()
         with open(self._path, "w", encoding="utf-8") as f:
             for m in self._messages:
                 f.write(json.dumps(m, ensure_ascii=False) + "\n")
@@ -192,6 +228,7 @@ class MessageStore:
 
     def _rewrite_jsonl(self):
         """Rewrite the JSONL file from current in-memory messages."""
+        self._save_id_state()
         with open(self._path, "w", encoding="utf-8") as f:
             for m in self._messages:
                 f.write(json.dumps(m, ensure_ascii=False) + "\n")
@@ -213,6 +250,11 @@ class MessageStore:
                 if removed_ids:
                     self._save_todos()
             else:
+                # A full clear truncates the log with a plain write instead of a
+                # rewrite, so it records the next id itself first: with no
+                # message left in the file the load would fall back to 0 and hand
+                # out an id that already reached the log.
+                self._save_id_state()
                 self._messages.clear()
                 self._path.write_text("")
                 self._todos.clear()
