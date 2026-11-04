@@ -109,6 +109,28 @@ def _finish_locked(path, queue, lines, status, attempts, consume=True):
     return matches
 
 
+def retain_stale(path, lines):
+    """Keep wakes addressed to another identity for manual recovery. Idempotent: a retry re-reads them."""
+    with queue_lock(path):
+        failed = path.with_suffix('.failed.jsonl')
+        try:
+            known = set(failed.read_text(encoding='utf-8').splitlines(keepends=True))
+        except FileNotFoundError:
+            known = set()
+        fresh = [line for line in lines if line not in known]
+        if not fresh:
+            return
+        with open(failed, 'a', encoding='utf-8') as record:
+            record.write(''.join(fresh))
+            record.flush()
+            os.fsync(record.fileno())
+        with open(path.with_suffix('.delivery.jsonl'), 'a', encoding='utf-8') as trace:
+            trace.write(json.dumps({'time':time.time(), 'outcome':'stale-identity', 'attempts':0,
+                                    'lines':len(fresh), 'sha256':_digest(fresh)}) + '\n')
+            trace.flush()
+            os.fsync(trace.fileno())
+
+
 def finish_batch(path, lines, status, attempts, *, consume=True):
     """Keep concurrent appends; retain uncertain/exhausted deliveries for manual recovery.
 

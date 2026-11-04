@@ -22,7 +22,10 @@ import sys
 import time
 import uuid
 
+from wake_gate import HELD, classify, enter_hold_reason, plain_text
+
 TMUX_COMMAND_TIMEOUT = 5.0
+IDLE_RECHECK_S = 0.15  # two captures this far apart must both read idle before any input
 
 
 def _session_exists(session_name: str) -> bool:
@@ -96,8 +99,52 @@ def _drop_buffer(name: str) -> None:
                    capture_output=True, timeout=TMUX_COMMAND_TIMEOUT)
 
 
-def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool | None:
+def _capture_styled(target: str) -> str | None:
+    """The visible screen with its styling, or None when it cannot be read. Sends nothing to the pane."""
+    result = subprocess.run(["tmux", "capture-pane", "-p", "-e", "-t", target],
+                            capture_output=True, timeout=TMUX_COMMAND_TIMEOUT)
+    return result.stdout.decode(errors="replace") if result.returncode == 0 else None
+
+
+def _idle_view(target: str, provider: str) -> tuple[str, bytes | None]:
+    """('', the screen's text to compare) when the known empty prompt shows; else (why a wake must wait, None)."""
+    screen = _capture_styled(target)
+    if screen is None:
+        return "unreadable", None
+    verdict, reason = classify(provider, screen)
+    if verdict != "idle":
+        return reason, None
+    view = plain_text(screen).encode()
+    return "", _without_codex_input_animation(view) if provider == "codex" else view
+
+
+def settled_hold_check(target: str, provider: str):
+    """The watcher's check: idle AND the same screen as its previous poll, about a second earlier.
+
+    Codex drops its "Working" line while it streams text, so a turn in progress can look idle for
+    as long as the stream lasts (real-codex-1, frames b-028, b-029). The text moving gives that away.
+    """
+    last = [None]
+
+    def check() -> str:
+        reason, view = _idle_view(target, provider)
+        if reason:
+            last[0] = None
+            return reason
+        settled = view == last[0]
+        last[0] = view
+        return "" if settled else "settling"
+
+    return check
+
+
+def inject(text: str, *, tmux_session: str, delay: float = 0.3, provider: str = "") -> bool | None | str:
     """Deliver text to the agent CLI as ONE bracketed paste, then press Enter.
+
+    Fail closed (ad-519): unless two captures show the provider's known empty prompt and the same
+    text, this returns HELD having sent nothing, not even a mode change. After the paste it looks again, and without
+    the pasted text in the prompt it does not press Enter and returns None. True means tmux took the
+    keystrokes; it does not mean the agent read them.
 
     Why a paste and not send-keys: a pty's raw input queue is finite (1024
     bytes on macOS), so a single long `send-keys -l` can reach the CLI as
@@ -120,7 +167,7 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool | None:
     buffer_name = f"agentchattr-inject-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     paste_attempted = [False]
     try:
-        return _deliver(text, tmux_session, buffer_name, delay, paste_attempted)
+        return _deliver(text, tmux_session, buffer_name, delay, paste_attempted, provider)
     except Exception as exc:  # launching tmux itself failed, not a non-zero exit
         print(f"  INJECT FAILED: {type(exc).__name__}: {exc}")
         try:
@@ -131,12 +178,22 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3) -> bool | None:
 
 
 def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float,
-             paste_attempted: list[bool]) -> bool | None:
+             paste_attempted: list[bool], provider: str) -> bool | None | str:
     """The paste-then-Enter sequence; every tmux exit status is checked."""
     pane = _pane_id(tmux_session)
     if pane is None:
         print(f"  INJECT FAILED: no pane for tmux session {tmux_session!r}")
         return False
+
+    reason, first = _idle_view(pane, provider)
+    if not reason:
+        time.sleep(IDLE_RECHECK_S)
+        reason, second = _idle_view(pane, provider)
+        if not reason and second != first:
+            reason = "settling"
+    if reason:
+        print(f"  WAKE HELD ({reason}): nothing typed into pane {pane}")
+        return HELD
 
     # A scrolled pane (copy mode) would swallow the Enter below; leave the mode first, and
     # paste nothing if the pane will not leave it, so a later retry cannot double the prompt.
@@ -178,6 +235,11 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float,
     if not _leave_mode(pane):
         print(f"  INJECT FAILED: pane {pane} is in a tmux mode it did not leave (or the mode is "
               f"unreadable) after the paste; Enter not sent")
+        return None
+    screen = _capture_styled(pane)
+    reason = "unreadable" if screen is None else enter_hold_reason(provider, screen, text)
+    if reason:
+        print(f"  INJECT STOPPED ({reason}): pasted but the prompt does not show it; Enter not sent")
         return None
     entered = subprocess.run(
         ["tmux", "send-keys", "-t", pane, "Enter"],
@@ -257,6 +319,7 @@ def run_agent(
     on_failed=None,
     clear_ready=None,
     stash_inject_fn=None,
+    provider="",
 ):
     """Run agent inside a tmux session, inject via tmux send-keys.
 
@@ -293,7 +356,9 @@ def run_agent(
     abs_cwd = str(Path(cwd).resolve())
 
     # Wire up injection with the tmux session name
-    inject_fn = lambda text: inject(text, tmux_session=session_name, delay=inject_delay)
+    inject_fn = lambda text: inject(text, tmux_session=session_name, delay=inject_delay, provider=provider)
+    # Travels with the injector, so the watcher and its monitor's replacement both hold (ad-519).
+    inject_fn.hold_check = settled_hold_check(session_name, provider)
     if ready_gate_cfg is None:
         start_watcher(inject_fn)        # ungated: today's behavior, unchanged
     else:

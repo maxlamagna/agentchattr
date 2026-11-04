@@ -35,6 +35,21 @@ if ROOT not in sys.path:
 
 import wrapper_unix  # noqa: E402
 
+_SCREEN_PATCHES = [mock.patch.object(wrapper_unix, "_idle_view", return_value=("", b"")),
+                   mock.patch.object(wrapper_unix, "enter_hold_reason", return_value="")]
+
+
+def setUpModule():
+    """This suite tests the transport, so the ad-519 screen checks are answered here; test_wake_gate tests those."""
+    for patcher in _SCREEN_PATCHES:
+        patcher.start()
+
+
+def tearDownModule():
+    for patcher in _SCREEN_PATCHES:
+        patcher.stop()
+
+
 OPEN = b"\x1b[200~"
 CLOSE = b"\x1b[201~"
 HAVE_TMUX = shutil.which("tmux") is not None

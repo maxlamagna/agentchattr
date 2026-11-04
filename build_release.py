@@ -33,6 +33,7 @@ INCLUDE_FILES = [
     "wrapper.py",
     "wrapper_api.py",
     "wrapper_unix.py",
+    "wake_gate.py",
     "wrapper_windows.py",
     "open_chat.html",
     "config.toml",

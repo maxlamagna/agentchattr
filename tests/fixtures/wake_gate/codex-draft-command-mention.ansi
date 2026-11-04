@@ -1,0 +1,45 @@
+
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.166.0)[0m
+     [2m/private/tmp/claude-501/ad519draft.zthztsr1/work[0m
+
+[2m  To get started, describe a task or try one of these commands:[0m
+
+  /init[2m - create an AGENTS.md file with instructions for Codex[0m
+  /status[2m - show current session configuration[0m
+  /permissions[2m - choose what Codex is allowed to do[0m
+  /model[2m - choose what model and reasoning effort to use[0m
+  /review[2m - review any changes and find issues[0m
+
+[1m⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.[0m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                         [1m[38;2;196;167;103m⚠ weekly limit: only 3% left · resets at 08:22 · /status[0m
+
+[1m›[0m /model
+  @file · Context 5% left
+
+  [38;2;246;226;183mGPT-6.1-Sol low[39m · [38;2;171;223;167m/private/tmp/claude-501/ad519draft.zthztsr1/work[39m · [38;2;242;181;144mContext 100% left[39m · [38;2;242;181;144mContext 0% used[39m · [38;2;233;144;169m5h 95% left[39m · [38;2;233;144;169mweekly…
+[39m                                                                                                        ⚠ [38;2;196;167;103m3 warnings[39m · [1mf2[0m to view

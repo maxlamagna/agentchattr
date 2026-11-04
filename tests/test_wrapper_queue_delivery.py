@@ -146,7 +146,8 @@ class QueueDeliveryTests(unittest.TestCase):
         self.assertEqual(self.queue.read_text(), '')
         trace = (self.root / 'tester_queue.delivery.jsonl').read_text()
         self.assertIn('not-pasted', trace)
-        self.assertIn('delivered', trace)
+        self.assertIn('transport-accepted', trace)
+        self.assertNotIn('delivered', trace)
 
     def test_persistent_pre_paste_failure_is_bounded_and_preserved(self):
         self.put('COMPLETION-A')
@@ -193,7 +194,9 @@ if verb == os.environ['TEST_DELIVERY_FAILURE']: sys.exit(1)
                 self.put('COMPLETION-A')
                 env = {'PATH':str(self.root)+os.pathsep+os.environ.get('PATH',''),
                        'TEST_DELIVERY_ROOT':str(self.root), 'TEST_DELIVERY_FAILURE':failure}
-                with mock.patch.dict(os.environ, env), mock.patch('sys.stdout'):
+                with mock.patch.dict(os.environ, env), mock.patch('sys.stdout'), \
+                     mock.patch.object(wrapper_unix, '_idle_view', return_value=('', b'')), \
+                     mock.patch.object(wrapper_unix, 'enter_hold_reason', return_value=''):
                     calls = self.watch(injector=lambda text: wrapper_unix.inject(
                         text, tmux_session='fixture', delay=0))
                 verbs = (self.root/'calls').read_text().splitlines()

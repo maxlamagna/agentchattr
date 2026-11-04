@@ -125,6 +125,7 @@ case "$cmd" in
         # -p (bracketed paste) is terminal state the pane would add; the flag
         # is already visible in calls.log, so keys.log stays the plain bytes.
         printf '%s\n' "$(cat "$buf")" >> "$FAKE_TMUX_DIR/keys.log"
+        cp "$buf" "$FAKE_TMUX_DIR/pasted"
         for arg in "$@"; do
             [ "$arg" = "-d" ] && rm -f "$buf"
         done
@@ -140,6 +141,7 @@ case "$cmd" in
         ;;
     send-keys)
         printf '%s\n' "$*" >> "$FAKE_TMUX_DIR/keys.log"
+        rm -f "$FAKE_TMUX_DIR/pasted"
         exit 0
         ;;
     attach-session)
@@ -151,6 +153,26 @@ case "$cmd" in
         exit 0
         ;;
     capture-pane)
+        # The wake gate's styled capture (ad-519): an idle Claude-shaped prompt holding whatever was
+        # pasted since the last Enter, or the file wake-screen when a test scripts one. No scenario line.
+        case " $* " in
+            *' -e '*)
+                ls "$FAKE_TMUX_DIR"/session.* >/dev/null 2>&1 || exit 1
+                if [ -f "$FAKE_TMUX_DIR/wake-screen" ]; then
+                    cat "$FAKE_TMUX_DIR/wake-screen"
+                    exit 0
+                fi
+                rule='────────────────────────────────────────'
+                printf '%s\n' "$rule"
+                if [ -f "$FAKE_TMUX_DIR/pasted" ]; then
+                    printf '❯ %s\n' "$(cat "$FAKE_TMUX_DIR/pasted")"
+                else
+                    printf '❯ \n'
+                fi
+                printf '%s\n' "$rule"
+                exit 0
+                ;;
+        esac
         [ -f "$flag" ] || exit 1
         total=$(wc -l < "$FAKE_TMUX_DIR/scenario" 2>/dev/null || echo 0)
         total=$((total + 0))

@@ -10,8 +10,18 @@ from unittest import mock
 import wrapper_unix
 
 
+class _ScreenSaysIdle(unittest.TestCase):
+    """These suites test the transport, so the ad-519 screen checks are answered here; test_wake_gate tests those."""
+
+    def setUp(self):
+        for name, answer in (('_idle_view', ('', b'')), ('enter_hold_reason', '')):
+            patcher = mock.patch.object(wrapper_unix, name, return_value=answer)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
 @unittest.skipIf(sys.platform == 'win32', 'Unix executable fixture')
-class InjectTimeoutTests(unittest.TestCase):
+class InjectTimeoutTests(_ScreenSaysIdle):
     def test_stuck_delivery_and_cleanup_return_without_retyping(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -46,7 +56,7 @@ class InjectTimeoutTests(unittest.TestCase):
 
 
 @unittest.skipIf(sys.platform == 'win32', 'Unix executable fixture')
-class InjectCopyModeTests(unittest.TestCase):
+class InjectCopyModeTests(_ScreenSaysIdle):
     """A pane in a tmux mode keeps send-keys for the mode, so inject() must leave it first."""
 
     def _inject(self, mode_answer, sticky=False, mode_after_paste=False):

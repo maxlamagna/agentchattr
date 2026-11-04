@@ -25,7 +25,8 @@ import sys
 import threading
 import time
 from pathlib import Path
-from queue_io import read_batch, begin_batch, finish_batch
+from queue_io import read_batch, begin_batch, finish_batch, retain_stale
+from wake_gate import HELD, gate_provider
 
 ROOT = Path(__file__).parent
 
@@ -487,10 +488,79 @@ def instance_wake_env(identity_id: str, server_port: int, name: str) -> dict[str
     }
 
 
+HOLD_NOTICE_AFTER_S = 300
+HOLD_NOTICE_RETRY_S = 60
+
+
+def _post_hold_notice(server_port: int, token: str, channel: str, text: str) -> bool:
+    """Post through the wrapper's own token, so no server change is needed. No @mention: it wakes nobody."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/send", method="POST",
+            data=json.dumps({"text": text, "channel": channel}).encode(),
+            headers=_auth_headers(token, include_json=True))
+        urllib.request.urlopen(req, timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+class _WakeHold:
+    """A held wake's visible record (ad-519): `<queue>.hold.json` and, once, one chat notice."""
+
+    def __init__(self, post_notice):
+        self.post_notice = post_notice
+        self.state = None
+        self.next_post = 0.0
+        self.swept = False
+
+    def _write(self, path):
+        tmp = path.with_suffix('.hold.tmp')
+        tmp.write_text(json.dumps(self.state), 'utf-8')
+        os.replace(tmp, path)
+
+    def held(self, queue_file, name, reason, lines):
+        path = queue_file.with_suffix('.hold.json')
+        self.swept = True
+        if self.state is None:
+            try:
+                self.state = json.loads(path.read_text('utf-8'))  # survives a wrapper restart
+            except (OSError, ValueError):
+                self.state = {"since": time.time(), "noticed": False}
+        changed = self.state.get("reason") != reason or self.state.get("count") != len(lines)
+        self.state.update(reason=reason, count=len(lines))
+        now = time.time()
+        if not self.state["noticed"] and now - self.state["since"] >= HOLD_NOTICE_AFTER_S and now >= self.next_post:
+            channel = 'general'
+            try:
+                channel = json.loads(lines[0]).get('channel') or channel
+            except (IndexError, ValueError, AttributeError):
+                pass
+            minutes = int((now - self.state["since"]) // 60)
+            self.state["noticed"] = self.post_notice(channel, (
+                f"[wrapper for {name}] {len(lines)} wake(s) held for {minutes} min, nothing typed "
+                f"({reason}). They stay queued and go in once the prompt is idle."))
+            self.next_post = now + HOLD_NOTICE_RETRY_S
+            changed = changed or self.state["noticed"]
+        if changed:
+            self._write(path)
+
+    def release(self, queue_file):
+        if self.state is None and self.swept:
+            return
+        self.state = None
+        self.swept = True
+        queue_file.with_suffix('.hold.json').unlink(missing_ok=True)
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10, ready_flag=None, get_identity_id_fn=None):
     """Poll queue file and inject an MCP read task when triggered."""
+    hold_check = getattr(inject_fn, 'hold_check', None)  # absent on Windows, whose flow is unchanged
+    hold = _WakeHold(lambda channel, text: _post_hold_notice(
+        server_port, get_token_fn() if get_token_fn else "", channel, text))
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
     trigger_count = 0
@@ -514,12 +584,27 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 disposition = ''
                 pending_prompt = ''
                 prompt_key = None
+                if not pending:
+                    hold.release(pending_file)
             if pending:
                 # A failed acknowledgement after a paste must never paste again.
                 if disposition:
                     finish_batch(pending_file, pending, disposition, attempts)
                     pending = []
                     continue
+
+                # ad-519: before any activity flag, rules sync, attempt or journal. The wake stays
+                # queued with no attempt counted; re-reading next poll lets later appends join it.
+                if hold_check is not None:
+                    try:
+                        reason = hold_check()
+                    except Exception as exc:
+                        reason = f"check-error:{type(exc).__name__}"
+                    if reason:
+                        hold.held(pending_file, get_identity_fn()[0], reason, pending)
+                        pending = []
+                        time.sleep(1)
+                        continue
                 lines = pending
 
                 # Exact-instance wake: a line addressed to a different identity
@@ -531,6 +616,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 own_identity = get_identity_id_fn() if get_identity_id_fn else ""
                 if isinstance(own_identity, str) and own_identity:
                     kept = []
+                    stale = []
                     for line in lines:
                         addressee = ""
                         stripped = line.strip()
@@ -545,9 +631,12 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                                     addressee = iid
                         if addressee and addressee != own_identity:
                             print(f"  WAKE DROPPED: queue line for identity {addressee[:8]}")
+                            stale.append(line)
                             continue
                         kept.append(line)
                     lines = kept
+                    if stale:  # before its prefix is consumed: not ours to act on, but someone's to recover
+                        retain_stale(pending_file, stale)
 
                 prompts = []
                 for line in lines:
@@ -588,6 +677,8 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     if role:
                         prompt += f"\n\nROLE: {role}"
 
+                    before_compose = (last_rules_epoch, first_mention)
+
                     # Smart rules injection: first trigger, epoch change, or periodic refresh
                     _token = get_token_fn() if get_token_fn else ""
                     rules_data = _fetch_active_rules(server_port, _token)
@@ -623,12 +714,22 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         result = inject_fn(pending_prompt)
                     except Exception:
                         result = None  # an exception does not prove nothing was pasted
-                    if result is False and attempts < 3:
+                    if result is HELD:
+                        # The screen changed after the hold check: nothing typed, so nothing was used up.
+                        finish_batch(pending_file, pending, 'held', attempts, consume=False)
+                        hold.held(pending_file, current_name, 'changed-before-paste', pending)
+                        last_rules_epoch, first_mention = before_compose
+                        if trigger_flag is not None:
+                            trigger_flag[0] = False
+                        pending = []
+                    elif result is False and attempts < 3:
                         if finish_batch(pending_file, pending, 'not-pasted', attempts, consume=False) is False:
                             pending = []  # another consumer replaced/acknowledged this batch
                     else:
-                        disposition = ('delivered' if result is True else
+                        # tmux taking the keys is not the agent reading them: never call this delivered.
+                        disposition = ('transport-accepted' if result is True else
                                        'not-pasted-exhausted' if result is False else 'uncertain')
+                        hold.release(pending_file)  # only now: a later HELD must keep the hold's age
                         finish_batch(pending_file, pending, disposition, attempts)
                         pending = []
                 else:
@@ -1135,6 +1236,7 @@ def main():
         run_kwargs["enter_backend"] = agent_cfg.get("enter_backend", "console_input")
     if sys.platform != "win32":
         run_kwargs["session_name"] = unix_session_name
+        run_kwargs["provider"] = gate_provider(command)
         # Ready gate is unix-only (the boxes are linux); Windows keeps today's
         # exact flow, and an ungated unix run passes all-None (same behavior).
         run_kwargs["ready_gate_cfg"] = ready_gate_cfg
