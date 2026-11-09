@@ -12,6 +12,8 @@ command = "claude"
 cwd = ".."
 color = "#da7756"
 label = "Claude"
+mcp_inject = "proxy_flag"
+mcp_proxy_flag_template = '--mcp-config {{"mcpServers":{{"{server}":{{"type":"http","url":"{url}"}}}}}}'
 
 [agents.codex]
 command = "codex"
