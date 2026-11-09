@@ -962,6 +962,8 @@ function appendMessage(msg, options = {}) {
                 const truncated = parentText.length > 80 ? parentText.slice(0, 80) + '...' : parentText;
                 const parentColor = parentEl.querySelector('.msg-sender')?.style.color || 'var(--text-dim)';
                 replyHtml = `<div class="reply-quote" onclick="scrollToMessage(${msg.reply_to})"><span class="reply-sender" style="color: ${parentColor}">${escapeHtml(parentSender)}</span> ${escapeHtml(truncated)}</div>`;
+            } else {
+                replyHtml = `<button class="reply-quote history-parent" type="button" onclick="chatHistory.context(${Number(msg.reply_to)})">View reply to #${Number(msg.reply_to)}</button>`;
             }
         }
 
@@ -1938,7 +1940,7 @@ function applySettings(data) {
         document.getElementById('setting-hops').value = data.max_agent_hops;
     }
     if (data.history_limit !== undefined) {
-        document.getElementById('setting-history').value = String(data.history_limit);
+        document.getElementById('setting-history').value = String(Math.min(500, Number(data.history_limit) || 500));
     }
     if (data.contrast) {
         document.body.classList.toggle('high-contrast', data.contrast === 'high');
@@ -2787,7 +2789,7 @@ function cancelReply() {
 
 function scrollToMessage(msgId) {
     const el = document.querySelector(`.message[data-id="${msgId}"]`);
-    if (!el) return;
+    if (!el) { window.chatHistory?.context(msgId); return; }
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     el.classList.add('highlight');
     setTimeout(() => el.classList.remove('highlight'), 1500);

@@ -7,12 +7,14 @@ import sys
 import threading
 import uuid
 import logging
+import math
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.requests import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from store import MessageStore
 from rules import RuleStore
@@ -55,7 +57,7 @@ room_settings: dict = {
     "username": "user",
     "font": "sans",
     "channels": ["general"],
-    "history_limit": "all",
+    "history_limit": 500,
     "contrast": "normal",
     "custom_roles": [],
 }
@@ -150,6 +152,13 @@ def apply_room_subtitle(new: dict):
         room_settings["subtitle"] = cleaned
 
 
+def browser_history_limit(value):
+    try:
+        return max(1, min(int(value), 500))
+    except (ValueError, TypeError, OverflowError):
+        return 500
+
+
 def _load_settings():
     global room_settings
     p = _settings_path()
@@ -162,6 +171,7 @@ def _load_settings():
     # settings.json is hand-editable, so the file bypasses every check the
     # live update path applies. Re-normalise on load rather than trust it.
     room_settings["subtitle"] = normalize_room_subtitle(room_settings.get("subtitle")) or ""
+    room_settings['history_limit'] = browser_history_limit(room_settings.get('history_limit'))
     # Ensure "general" always exists and is first
     if "channels" not in room_settings or not room_settings["channels"]:
         room_settings["channels"] = ["general"]
@@ -1148,7 +1158,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # Send history (per channel based on history_limit)
     limit_val = room_settings.get("history_limit", "all")
-    count = 10000 if limit_val == "all" else int(limit_val)
+    count = browser_history_limit(limit_val)
     
     history = []
     for ch in room_settings["channels"]:
@@ -1350,15 +1360,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     except (ValueError, TypeError):
                         pass
                 if "history_limit" in new:
-                    val = str(new["history_limit"]).strip().lower()
-                    if val == "all":
-                        room_settings["history_limit"] = "all"
-                    else:
-                        try:
-                            val_int = int(val)
-                            room_settings["history_limit"] = max(1, min(val_int, 10000))
-                        except (ValueError, TypeError):
-                            pass
+                    room_settings['history_limit'] = browser_history_limit(new['history_limit'])
                 if "custom_roles" in new and isinstance(new["custom_roles"], list):
                     room_settings["custom_roles"] = [
                         str(r).strip()[:20] for r in new["custom_roles"]
@@ -1620,6 +1622,41 @@ async def get_messages(since_id: int = 0, limit: int = 50, channel: str = ""):
     if since_id:
         return store.get_since(since_id, channel=ch)
     return store.get_recent(limit, channel=ch)
+
+
+@app.post('/api/history/search')
+async def search_history(request: Request):
+    # Read manually: automatic validation errors can echo private search input.
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError()
+        options = {key: body.get(key, '') for key in ('text', 'channel', 'sender')}
+        if any(not isinstance(value, str) for value in options.values()):
+            raise ValueError()
+        for key in ('from_ts', 'to_ts'):
+            value = body.get(key)
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
+                raise ValueError()
+            options[key] = value
+        if options['from_ts'] is not None and options['to_ts'] is not None and options['from_ts'] >= options['to_ts']:
+            raise ValueError()
+        for key, default in (('before_id', None), ('limit', 25)):
+            value = body.get(key, default)
+            if value is not None and (type(value) is not int or value < (1 if key == 'limit' else 0)):
+                raise ValueError()
+            if key == 'limit' and value is None:
+                raise ValueError()
+            options[key] = value
+    except (ValueError, TypeError, OverflowError):
+        return JSONResponse({'error': 'Invalid history search'}, status_code=400)
+    return await run_in_threadpool(store.search, **options)
+
+
+@app.get('/api/history/context/{msg_id}')
+def history_context(msg_id: int):
+    result = store.get_context(msg_id)
+    return result if result else JSONResponse({'error': 'Message unavailable'}, status_code=404)
 
 
 @app.post("/api/send")

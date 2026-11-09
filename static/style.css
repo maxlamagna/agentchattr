@@ -4570,3 +4570,36 @@ a.file-attachment:hover { border-color: var(--accent); }
     50% { box-shadow: 0 0 8px 2px var(--accent); }
 }
 .help-pulse { animation: helpPulse 1s ease 3; }
+/* Retained-history inspection has its own identities and bounded scroll area. */
+.history-dialog { color: var(--text); background: var(--bg); border: 1px solid var(--border);
+    border-radius: 12px; width: min(960px, 94vw); max-height: 90vh; padding: 20px; }
+.history-dialog::backdrop { background: #0009; }
+.history-dialog header, .history-dialog nav, .history-dialog footer { display: flex;
+    justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.history-dialog h2 { font-size: 18px; margin: 0; }
+.history-dialog button, #history-search { color: var(--text); background: var(--bg-raised, #252525);
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+.history-dialog button:hover, #history-search:hover { border-color: var(--text-dim); }
+.history-form { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 10px; margin: 16px 0; }
+.history-form label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-dim); }
+.history-form input, .history-form select { width: 100%; min-width: 0; box-sizing: border-box;
+    padding: 8px; border: 1px solid var(--border); border-radius: 5px; color: var(--text);
+    background: var(--bg-input, #151515); font: inherit; color-scheme: dark; }
+.history-form button { align-self: end; }
+.history-rows { max-height: 54vh; overflow-y: auto; overscroll-behavior: contain; }
+.history-row { padding: 14px 10px; border-top: 1px solid var(--border); }
+.history-row.history-target { border-left: 3px solid var(--accent, #78b5d2); background: #78b5d212; }
+.history-dialog .history-result { text-align: left; padding: 0; border: 0; background: transparent;
+    color: var(--text-dim); font: inherit; font-size: 12px; text-decoration: underline; }
+.history-meta, .history-status, .history-dialog footer, #history-note { color: var(--text-dim); font-size: 12px; }
+.history-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.5; margin-top: 8px; }
+.history-dialog footer { margin-top: 12px; margin-bottom: 0; }
+.history-parent { display: block; margin: 6px 0; cursor: pointer; }
+.history-dialog [hidden], #history-search[hidden], #history-note[hidden] { display: none; }
+@media (max-width: 600px) {
+    .history-dialog { padding: 12px; }
+    .history-form { grid-template-columns: 1fr 1fr; }
+    .history-form label:first-child { grid-column: 1 / -1; }
+    .history-dialog footer { align-items: start; flex-direction: column; }
+    #history-note { max-width: 110px; }
+}

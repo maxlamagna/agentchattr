@@ -157,6 +157,44 @@ class MessageStore:
                     return m
             return None
 
+    def search(self, text="", channel="", sender="", from_ts=None, to_ts=None,
+               before_id=None, limit=25) -> dict:
+        """Read a bounded page without holding up writers during the scan."""
+        limit = max(1, min(limit, 50))
+        with self._lock:
+            snapshot = list(self._messages)
+        matches = []
+        term, author = text.casefold(), sender.casefold()
+        for msg in sorted(snapshot, key=lambda m: m['id'], reverse=True):
+            if before_id is not None and msg['id'] >= before_id:
+                continue
+            if channel and msg.get('channel', 'general') != channel:
+                continue
+            if author and msg['sender'].casefold() != author:
+                continue
+            ts = msg.get('timestamp', 0)
+            if (from_ts is not None and ts < from_ts) or (to_ts is not None and ts >= to_ts):
+                continue
+            if term not in msg.get('text', '').casefold():
+                continue
+            matches.append(dict(msg))
+            if len(matches) > limit:
+                break
+        return {'messages': matches[:limit],
+                'next_before_id': matches[limit - 1]['id'] if len(matches) > limit else None}
+
+    def get_context(self, msg_id: int) -> dict | None:
+        with self._lock:
+            snapshot = list(self._messages)
+        target = next((m for m in snapshot if m['id'] == msg_id), None)
+        if target is None:
+            return None
+        channel = target.get('channel', 'general')
+        rows = [m for m in snapshot if m.get('channel', 'general') == channel]
+        index = next(i for i, m in enumerate(rows) if m['id'] == msg_id)
+        return {'target_id': msg_id, 'channel': channel,
+                'messages': [dict(m) for m in rows[max(0, index - 20):index + 21]]}
+
     def get_recent(self, count: int = 50, channel: str | None = None) -> list[dict]:
         with self._lock:
             msgs = self._messages

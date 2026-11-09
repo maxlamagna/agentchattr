@@ -73,6 +73,18 @@ class HistoryDeliveryTests(unittest.TestCase):
         self.assertFalse(any(f['type'] == 'history' for f in frames))
         self.assertEqual(sum(f['type'] == 'history_complete' for f in frames), 1)
 
+    def test_browser_cap_applies_to_legacy_all_and_large_settings(self):
+        for i in range(1100):
+            self.messages.add('Ben', f'Message {i}', channel='work' if i % 2 else 'general',
+                              timestamp=100 + i, _bulk=True)
+        for limit in ('all', 10000, 500, 'bad'):
+            self.settings['history_limit'] = limit
+            frames = self.read_connection()
+            saved = [m for f in frames if f['type'] == 'history' for m in f['messages']]
+            self.assertEqual(len(saved), 1000)
+            self.assertEqual(saved[0]['id'], 100)
+        self.assertEqual(len(self.messages.get_recent(2000)), 1100)
+
     def test_history_setting_is_applied_per_channel_without_deleting_messages(self):
         self.settings['history_limit'] = '3'
         for i in range(12):
