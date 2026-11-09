@@ -1079,6 +1079,7 @@ main#timeline {
 
 .reply-quote {
     font-size: 12px;
+    line-height: 1.5;
     color: var(--text-dim);
     padding: 3px 0 3px 8px;
     margin-bottom: 4px;
@@ -4602,4 +4603,20 @@ a.file-attachment:hover { border-color: var(--accent); }
     .history-form label:first-child { grid-column: 1 / -1; }
     .history-dialog footer { align-items: start; flex-direction: column; }
     #history-note { max-width: 110px; }
+}
+/* Keep pagination anchored explicitly when a bounded timeline edge is pruned. */
+main#timeline { scroll-behavior: auto; }
+#content-area { position: relative; }
+/* Hidden panels must match their negative margins, including resized widths. */
+#rules-panel.hidden, #jobs-panel.hidden { max-width: none; }
+.timeline-history-control {
+    display: block; margin: 10px auto; padding: 7px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text-dim);
+    font: inherit; font-size: 12px; cursor: pointer;
+}
+.timeline-history-control[hidden] { display: none; }
+#timeline-latest { position: absolute; z-index: 8; bottom: 12px; left: 50%; transform: translateX(-50%); }
+button.reply-quote {
+    display: block; width: 100%; text-align: left; font-family: inherit;
+    background: transparent; border-top: 0; border-right: 0; border-bottom: 0;
 }

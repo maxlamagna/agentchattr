@@ -183,6 +183,29 @@ class MessageStore:
         return {'messages': matches[:limit],
                 'next_before_id': matches[limit - 1]['id'] if len(matches) > limit else None}
 
+    def history_page(self, channel, before_id=None, after_id=None, limit=100) -> dict:
+        """A contiguous ID-ordered window; cursors remain valid through deletion gaps."""
+        limit = max(1, min(limit, 500))
+        with self._lock:
+            rows = [m for m in self._messages if m.get('channel', 'general') == channel]
+            eligible = [m for m in rows if (before_id is None or m['id'] < before_id)
+                        and (after_id is None or m['id'] > after_id)]
+            page = eligible[:limit] if after_id is not None else eligible[-limit:]
+            lower = page[0]['id'] if page else (after_id if after_id is not None else before_id)
+            upper = page[-1]['id'] if page else (before_id if before_id is not None else after_id)
+            return {'messages': [dict(m) for m in page],
+                    'has_before': lower is not None and any(m['id'] < lower for m in rows),
+                    'has_after': upper is not None and any(m['id'] > upper for m in rows)}
+
+    def reply_previews(self, ids) -> list[dict]:
+        wanted = set(ids)
+        with self._lock:
+            found = {m['id']: {'id': m['id'], 'sender': m['sender'],
+                              'text': m.get('text', '')[:81],
+                              'channel': m.get('channel', 'general')}
+                     for m in self._messages if m['id'] in wanted}
+        return [found[mid] for mid in dict.fromkeys(ids) if mid in found]
+
     def get_context(self, msg_id: int) -> dict | None:
         with self._lock:
             snapshot = list(self._messages)

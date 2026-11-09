@@ -285,18 +285,23 @@ function _sidebarConfirmDelete(name, row, label) {
 function switchChannel(name) {
     if (name === window.activeChannel) return;
     const prevChannel = window.activeChannel;
+    window.chatTimeline?.save(prevChannel);
     // Save top-visible message ID for current channel
     const topId = _getTopVisibleMsgId();
     if (topId) _channelScrollMsg[window.activeChannel] = topId;
     window._setActiveChannel(name);
     // Swap the sticky @-mention toggles to this channel's remembered set
     if (window._onChannelSwitchMentions) window._onChannelSwitchMentions(prevChannel, name);
-    window.channelUnread[name] = 0;
+    if (!window.chatTimeline) window.channelUnread[name] = 0;
     localStorage.setItem('agentchattr-channel', name);
     filterMessagesByChannel();
     renderChannelTabs();
     Store.set('activeChannel', name);
     document.querySelector('#channel-tabs .channel-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    if (window.chatTimeline?.activate(name)) {
+        if (typeof dayFloatRefresh === 'function') dayFloatRefresh();
+        return;
+    }
     // Restore: scroll to saved message, or bottom if none saved
     const savedId = _channelScrollMsg[name];
     if (savedId) {

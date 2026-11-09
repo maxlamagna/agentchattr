@@ -91,14 +91,14 @@ function _collapseJobBreadcrumbs(container, newEl) {
     let prev = newEl.previousElementSibling;
     let existingGroup = null;
     while (prev) {
-        if (prev.classList.contains('job-breadcrumb')) {
+        if (prev.classList.contains('job-breadcrumb') && prev.dataset.channel === newEl.dataset.channel) {
             crumbs.unshift(prev);
             prev = prev.previousElementSibling;
-        } else if (prev.classList.contains('job-group')) {
+        } else if (prev.classList.contains('job-group') && prev.querySelector('.job-breadcrumb')?.dataset.channel === newEl.dataset.channel) {
             // Already a collapsed group — absorb its children
             existingGroup = prev;
             const inner = [...prev.querySelectorAll('.job-breadcrumb')];
-            inner.forEach(c => crumbs.unshift(c));
+            crumbs.unshift(...inner);
             prev = prev.previousElementSibling;
             existingGroup.remove();
             break;

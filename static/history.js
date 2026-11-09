@@ -18,7 +18,7 @@
     };
     function close() {
         invalidate(); dialog.close(); rows.replaceChildren(); page = null;
-        document.getElementById('timeline').scrollTop = document.getElementById('timeline').scrollHeight;
+        window.scrollToBottom();
         document.getElementById('input').focus();
     }
     function show() {

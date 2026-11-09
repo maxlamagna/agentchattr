@@ -403,13 +403,16 @@ function scheduleHistoryRender() {
 function renderHistoryBatch() {
     historyScheduled = false;
     const fragment = document.createDocumentFragment();
-    for (const msg of pendingHistory.splice(0, 100)) {
+    const batch = pendingHistory.splice(0, 100);
+    batch.forEach(msg => window.chatTimeline?.remember(msg));
+    for (const msg of batch) {
         appendMessage(msg, { history: true, container: fragment });
     }
     const breadcrumbs = [...fragment.querySelectorAll('.job-breadcrumb')];
     const container = document.getElementById('messages');
     container.appendChild(fragment);
-    for (const el of breadcrumbs) window._collapseJobBreadcrumbs?.(container, el);
+    if (!window.chatTimeline) for (const el of breadcrumbs) window._collapseJobBreadcrumbs?.(container, el);
+    window.chatTimeline?.settle(batch);
     if (autoScroll) scrollToBottom(true);
     if (pendingHistory.length) {
         scheduleHistoryRender();
@@ -420,6 +423,7 @@ function renderHistoryBatch() {
         const events = pendingLiveEvents;
         pendingLiveEvents = [];
         for (const event of events) handleServerEvent(event);
+        window.chatTimeline?.replayDone();
         if (autoScroll) scrollToBottom(true);
     }
 }
@@ -441,6 +445,7 @@ function handleServerEvent(event) {
         scheduleHistoryRender();
         return;
     }
+    window.chatTimeline?.event(event);
     // Emit through Hub for modules to subscribe (PR 1 seam)
     Hub.emit(event.type, event);
     if (event.type === 'message_update') {
@@ -605,7 +610,7 @@ function handleServerEvent(event) {
         }
         // Migrate data-channel on existing DOM elements
         const container = document.getElementById('messages');
-        for (const el of container.children) {
+        for (const el of container.querySelectorAll('[data-channel]')) {
             if ((el.dataset.channel || 'general') === event.old_name) {
                 el.dataset.channel = event.new_name;
             }
@@ -682,6 +687,7 @@ function handleServerEvent(event) {
 }
 
 function connectWebSocket() {
+    window.chatTimeline?.replayStart();
     historyGeneration++;
     historyScheduled = false;
     historyLoading = true;
@@ -836,9 +842,30 @@ function dayFloatRefresh() {
 
 // --- Messages ---
 
+function trackMessageArrival(msg) {
+    window.chatTimeline?.arrival(msg);
+    const ch = msg.channel || 'general';
+    if (ch !== activeChannel) {
+        if (soundEnabled && msg.type !== 'join' && msg.type !== 'leave') {
+            channelUnread[ch] = (channelUnread[ch] || 0) + 1;
+            renderChannelTabs();
+            if (document.hasFocus() && msg.type === 'chat' && msg.sender && msg.sender.toLowerCase() !== username.toLowerCase()) playCrossChannelSound();
+        }
+    } else if (!autoScroll) {
+        unreadCount++;
+        updateScrollAnchor();
+    }
+}
+
 function appendMessage(msg, options = {}) {
+    window.chatTimeline?.remember(msg);
+    if (window.chatTimeline?.hold(msg, options)) {
+        if (!options.history) trackMessageArrival(msg);
+        return;
+    }
     // History replay and a live delivery can contain the same saved message.
     if (document.getElementById(`message-${msg.id}`)) return;
+    if (!options.history) trackMessageArrival(msg);
     const container = options.container || document.getElementById('messages');
 
     // Insert date divider if needed
@@ -846,10 +873,12 @@ function appendMessage(msg, options = {}) {
 
     const el = document.createElement('div');
     el.className = 'message';
+    if (options.history) el.style.animation = 'none';
     el.id = `message-${msg.id}`;
     el.dataset.id = msg.id;
     const msgChannel = msg.channel || 'general';
     el.dataset.channel = msgChannel;
+    el.dataset.date = getMessageDate(msg);
 
     if (msg.type === 'join' || msg.type === 'leave') {
         el.classList.add('join-msg');
@@ -955,6 +984,9 @@ function appendMessage(msg, options = {}) {
         // Reply quote (if this message is a reply)
         let replyHtml = '';
         if (msg.reply_to !== undefined && msg.reply_to !== null) {
+            if (window.chatTimeline) {
+                replyHtml = window.chatTimeline.quote(Number(msg.reply_to));
+            } else {
             const parentEl = document.querySelector(`.message[data-id="${msg.reply_to}"]`);
             if (parentEl) {
                 const parentSender = parentEl.querySelector('.msg-sender')?.textContent || '?';
@@ -964,6 +996,7 @@ function appendMessage(msg, options = {}) {
                 replyHtml = `<div class="reply-quote" onclick="scrollToMessage(${msg.reply_to})"><span class="reply-sender" style="color: ${parentColor}">${escapeHtml(parentSender)}</span> ${escapeHtml(truncated)}</div>`;
             } else {
                 replyHtml = `<button class="reply-quote history-parent" type="button" onclick="chatHistory.context(${Number(msg.reply_to)})">View reply to #${Number(msg.reply_to)}</button>`;
+            }
             }
         }
 
@@ -1001,21 +1034,13 @@ function appendMessage(msg, options = {}) {
     // Hide messages from other channels
     if (msgChannel !== activeChannel) {
         el.style.display = 'none';
-        // Track unread for background channels (skip joins/leaves and initial history load)
-        if (!options.history && soundEnabled && msg.type !== 'join' && msg.type !== 'leave') {
-            channelUnread[msgChannel] = (channelUnread[msgChannel] || 0) + 1;
-            renderChannelTabs();
-            // Play soft pluck for cross-channel chat messages from others (only when focused)
-            if (document.hasFocus() && msg.type === 'chat' && msg.sender && msg.sender.toLowerCase() !== username.toLowerCase()) {
-                playCrossChannelSound();
-            }
-        }
     }
 
     container.appendChild(el);
+    window.chatTimeline?.appended(msg, options);
 
     // Collapse consecutive job_created messages into a group
-    if (!options.history && msg.type === 'job_created' && window._collapseJobBreadcrumbs) {
+    if (!options.history && !window.chatTimeline && msg.type === 'job_created' && window._collapseJobBreadcrumbs) {
         window._collapseJobBreadcrumbs(container, el);
     }
 
@@ -1023,9 +1048,6 @@ function appendMessage(msg, options = {}) {
 
     if (autoScroll) {
         scrollToBottom();
-    } else {
-        unreadCount++;
-        updateScrollAnchor();
     }
 }
 
@@ -1084,9 +1106,14 @@ function colorMentions(textHtml) {
 }
 
 function scrollToBottom(instant = false) {
+    if (window.chatTimeline?.detached()) {
+        if (!instant) window.chatTimeline.latest();
+        return;
+    }
     const timeline = document.getElementById('timeline');
     timeline.scrollTo({ top: timeline.scrollHeight, behavior: instant ? 'instant' : 'auto' });
     unreadCount = 0;
+    window.chatTimeline?.readLatest();
     updateScrollAnchor();
 }
 window.scrollToBottom = scrollToBottom;
@@ -1094,7 +1121,7 @@ window.appendMessage = appendMessage;
 
 function updateScrollAnchor() {
     const anchor = document.getElementById('scroll-anchor');
-    if (autoScroll) {
+    if (autoScroll || window.chatTimeline?.detached()) {
         anchor.classList.add('hidden');
     } else {
         anchor.classList.remove('hidden');
@@ -1956,10 +1983,7 @@ function applySettings(data) {
         channelList = data.channels;
         // If active channel was deleted, switch to general
         if (!channelList.includes(activeChannel)) {
-            activeChannel = 'general';
-            localStorage.setItem('agentchattr-channel', 'general');
-            Store.set('activeChannel', 'general');
-            filterMessagesByChannel();
+            switchChannel('general');
         }
         renderChannelTabs();
 
@@ -2681,11 +2705,13 @@ function setupScroll() {
     }, { passive: true });
 
     timeline.addEventListener('scroll', () => {
+        if (window.chatTimeline?.moving) return;
         const distFromBottom = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight;
-        autoScroll = distFromBottom < 60;
+        autoScroll = distFromBottom < 60 && !window.chatTimeline?.detached();
 
         if (autoScroll) {
             unreadCount = 0;
+            window.chatTimeline?.readLatest();
         }
         updateScrollAnchor();
         dayFloatOnScroll();

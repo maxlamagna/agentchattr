@@ -34,13 +34,17 @@ class HistoryDeliveryTests(unittest.TestCase):
                             'ws_clients': set()}.items():
             self.stack.enter_context(patch.object(app, name, value))
 
-    def read_connection(self, interrupt=False):
+    def read_connection(self, interrupt=False, events=None):
         frames = []
+        incoming = list(events or [])
         class Socket:
             query_params = {'token': 'test'}
             interrupted = False
             async def accept(self): pass
-            async def receive_text(self): raise WebSocketDisconnect()
+            async def receive_text(self):
+                if incoming:
+                    return json.dumps(incoming.pop(0))
+                raise WebSocketDisconnect()
             async def send_text(socket, raw):
                 event = json.loads(raw)
                 frames.append(event)
@@ -72,6 +76,33 @@ class HistoryDeliveryTests(unittest.TestCase):
         frames = self.read_connection()
         self.assertFalse(any(f['type'] == 'history' for f in frames))
         self.assertEqual(sum(f['type'] == 'history_complete' for f in frames), 1)
+
+    def test_rename_precedes_settings_so_clients_keep_the_active_conversation(self):
+        import mcp_bridge
+        msg = self.messages.add('Ben', 'Fixture', channel='work')
+        self.stack.enter_context(patch.object(app, '_save_settings'))
+        migrated = self.stack.enter_context(patch.object(mcp_bridge, 'migrate_cursors_rename'))
+        frames = self.read_connection(events=[{'type': 'channel_rename', 'old_name': 'work', 'new_name': 'renamed'}])
+        end = next(i for i, f in enumerate(frames) if f['type'] == 'history_complete')
+        tail = [f for f in frames[end + 1:] if f['type'] in ('settings', 'channel_renamed')]
+        self.assertEqual([f['type'] for f in tail], ['channel_renamed', 'settings'])
+        self.assertEqual(tail[-1]['data']['channels'], ['general', 'renamed'])
+        self.assertEqual(self.messages.get_by_id(msg['id'])['channel'], 'renamed')
+        migrated.assert_called_once_with('work', 'renamed')
+
+    def test_channel_delete_clears_client_history_before_removing_the_channel(self):
+        import mcp_bridge
+        msg = self.messages.add('Ben', 'Fixture', channel='work')
+        self.stack.enter_context(patch.object(app, '_save_settings'))
+        migrated = self.stack.enter_context(patch.object(mcp_bridge, 'migrate_cursors_delete'))
+        frames = self.read_connection(events=[{'type': 'channel_delete', 'name': 'work'}])
+        end = next(i for i, f in enumerate(frames) if f['type'] == 'history_complete')
+        tail = [f for f in frames[end + 1:] if f['type'] in ('settings', 'clear')]
+        self.assertEqual([f['type'] for f in tail], ['clear', 'settings'])
+        self.assertEqual(tail[0]['channel'], 'work')
+        self.assertEqual(tail[-1]['data']['channels'], ['general'])
+        self.assertIsNone(self.messages.get_by_id(msg['id']))
+        migrated.assert_called_once_with('work')
 
     def test_browser_cap_applies_to_legacy_all_and_large_settings(self):
         for i in range(1100):

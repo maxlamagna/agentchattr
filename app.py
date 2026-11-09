@@ -1468,7 +1468,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 import mcp_bridge
                 mcp_bridge.migrate_cursors_rename(old_name, new_name)
                 _save_settings()
-                await broadcast_settings()
                 # Tell clients to migrate DOM elements
                 rename_event = json.dumps({
                     "type": "channel_renamed",
@@ -1480,6 +1479,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await c.send_text(rename_event)
                     except Exception:
                         pass
+                await broadcast_settings()
 
             elif event.get("type") == "channel_delete":
                 name = (event.get("name") or "").strip().lower()
@@ -1492,6 +1492,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 import mcp_bridge
                 mcp_bridge.migrate_cursors_delete(name)
                 _save_settings()
+                await broadcast_clear(channel=name)
                 await broadcast_settings()
 
     except WebSocketDisconnect:
@@ -1651,6 +1652,37 @@ async def search_history(request: Request):
     except (ValueError, TypeError, OverflowError):
         return JSONResponse({'error': 'Invalid history search'}, status_code=400)
     return await run_in_threadpool(store.search, **options)
+
+
+@app.post('/api/history/page')
+async def history_page(request: Request):
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get('channel'), str) or not body['channel']:
+            raise ValueError()
+        options = {'channel': body['channel']}
+        for key, default in (('before_id', None), ('after_id', None), ('limit', 100)):
+            value = body.get(key, default)
+            if value is not None and (type(value) is not int or value < (1 if key == 'limit' else 0)):
+                raise ValueError()
+            options[key] = value
+        if options['limit'] is None or (options['before_id'] is not None and options['after_id'] is not None):
+            raise ValueError()
+    except (ValueError, TypeError, OverflowError):
+        return JSONResponse({'error': 'Invalid history page'}, status_code=400)
+    return await run_in_threadpool(store.history_page, **options)
+
+
+@app.post('/api/history/parents')
+async def history_parents(request: Request):
+    try:
+        body = await request.json()
+        ids = body.get('ids') if isinstance(body, dict) else None
+        if not isinstance(ids, list) or len(ids) > 50 or any(type(i) is not int or i < 0 for i in ids):
+            raise ValueError()
+    except (ValueError, TypeError):
+        return JSONResponse({'error': 'Invalid reply parents'}, status_code=400)
+    return {'messages': await run_in_threadpool(store.reply_previews, ids)}
 
 
 @app.get('/api/history/context/{msg_id}')
