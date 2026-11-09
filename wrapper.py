@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from queue_io import read_batch, begin_batch, finish_batch, retain_stale
+from queue_io import read_batch, begin_batch, finish_batch, retain_stale, queue_lock
 from wake_gate import HELD, gate_provider
 
 ROOT = Path(__file__).parent
@@ -388,19 +388,174 @@ def _build_provider_launch(
 
 
 def _register_instance(server_port: int, base: str, label: str | None = None,
-                       ready_gate: bool = False) -> dict:
+                       ready_gate: bool = False, name: str | None = None) -> dict:
+    """POST /api/register. Unnamed: the server picks the lowest free slot.
+    Named: send only through _register_named, which checks the server first."""
     import urllib.request
 
-    reg_body = json.dumps({"base": base, "label": label,
-                           "ready_gate": ready_gate}).encode()
+    body = {"base": base, "label": label, "ready_gate": ready_gate}
+    if name:
+        body["name"] = name
     reg_req = urllib.request.Request(
         f"http://127.0.0.1:{server_port}/api/register",
         method="POST",
-        data=reg_body,
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(reg_req, timeout=5) as reg_resp:
         return json.loads(reg_resp.read())
+
+
+# --- Stable identities (ad-e5gz) ---------------------------------------------
+# A wrapper asks for a name only from a server that declares this contract;
+# an older server would treat a named registration as an ordinary one, which
+# can rename the live slot-1 holder there before any reply could be checked.
+IDENTITY_CONTRACT = 2
+
+
+class RegistrationRefused(Exception):
+    """A named registration that was not granted. `code`: the server's error
+    (name_in_use, slot_in_use, family_conflict, invalid_name) or one of
+    server_unsupported, name_mismatch, unreachable, http_<status>."""
+
+    def __init__(self, code: str, message: str = ""):
+        super().__init__(f"{code}: {message}" if message else code)
+        self.code = code
+        self.message = message
+
+
+def _server_identity_contract(server_port: int) -> int:
+    """The identity contract the server declares; 0 when it declares none or
+    cannot be read (both mean: send no named registration)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{server_port}/api/register/capabilities", timeout=3) as resp:
+            value = json.loads(resp.read()).get("identity_contract", 0)
+        return value if isinstance(value, int) else 0
+    except Exception:
+        return 0
+
+
+def _register_named(server_port: int, base: str, label: str | None, ready_gate: bool,
+                    name: str) -> dict:
+    """Register as exactly `name`, or raise RegistrationRefused.
+
+    Checks the server's contract BEFORE sending, and compares the returned
+    name with the requested one BEFORE the caller touches any queue file or
+    tmux session. A different returned name is released, never adopted:
+    taking another name would be the automatic rename this contract forbids.
+    """
+    import urllib.error
+    import urllib.request
+
+    if _server_identity_contract(server_port) < IDENTITY_CONTRACT:
+        raise RegistrationRefused(
+            "server_unsupported",
+            "the server does not declare the stable-identity contract; no registration sent")
+    try:
+        reg = _register_instance(server_port, base, label, ready_gate=ready_gate, name=name)
+    except urllib.error.HTTPError as exc:
+        code, detail = f"http_{exc.code}", ""
+        try:
+            payload = json.loads(exc.read() or b"{}")
+            code = payload.get("error") or code
+            detail = payload.get("detail", "")
+        except Exception:
+            pass
+        raise RegistrationRefused(code, detail) from None
+    except (urllib.error.URLError, OSError) as exc:
+        raise RegistrationRefused("unreachable", str(exc)) from None
+    if reg.get("name") != name:
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{server_port}/api/deregister/{reg.get('name', '')}",
+                method="POST", data=b"", headers=_auth_headers(reg.get("token", ""))), timeout=5)
+        except Exception:
+            pass
+        raise RegistrationRefused("name_mismatch",
+                                  f"asked for {name}, the server returned {reg.get('name')}")
+    return reg
+
+
+def _check_queue_owner(server_port: int, name: str, token: str) -> str:
+    """Ask the server whether this wrapper's token owns `name`'s queue.
+
+    One authenticated heartbeat: the server answers with the token's own
+    instance name. Returns owner | other (the token is someone else) |
+    stale (409: the token is dead) | refused (another HTTP error) |
+    unreachable (no answer)."""
+    import urllib.error
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/heartbeat/{name}",
+            method="POST", data=b"", headers=_auth_headers(token))
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            reply = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return "stale" if exc.code == 409 else "refused"
+    except Exception:
+        return "unreachable"
+    return "owner" if reply.get("name") == name else "other"
+
+
+def _queue_line_identity(line: str) -> str:
+    try:
+        data = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    iid = data.get("identity_id") if isinstance(data, dict) else None
+    return iid if isinstance(iid, str) else ""
+
+
+def _dispose_queue_at_start(queue_file: Path, own_identity_id: str, named: bool) -> dict:
+    """Replace the old start-up erasure: no queued wake disappears without a copy.
+
+    (a) every line is appended to `<queue>.startup.jsonl` first;
+    (b) lines addressed to another identity_id (a retired identity) go to the
+        stale-retained file for the controller, never injected;
+    (c) a --name return keeps the name-addressed lines queued (delivered once the
+        ownership fence opens); an unnamed launch clears them after the copy, since
+        a new agent on a recycled name is not their addressee.
+    A batch a dead wrapper left mid-delivery is settled first, exactly as the
+    watcher would (read_batch: preserved as uncertain, never resent). Hold records
+    and earlier delivery-journal records are not touched.
+    """
+    counts = {"copied": 0, "kept": 0, "retained": 0, "cleared": 0}
+    if not queue_file.exists():
+        return counts
+    read_batch(queue_file)
+    stale = []
+    with queue_lock(queue_file):
+        try:
+            lines = queue_file.read_text("utf-8").splitlines(keepends=True)
+        except FileNotFoundError:
+            return counts
+        if not lines:
+            return counts
+        evidence = queue_file.with_suffix(".startup.jsonl")
+        with open(evidence, "a", encoding="utf-8") as copy:
+            copy.write("".join(l if l.endswith("\n") else l + "\n" for l in lines))
+            copy.flush()
+            os.fsync(copy.fileno())
+        keep = []
+        for line in lines:
+            iid = _queue_line_identity(line.strip())
+            if iid and iid != own_identity_id:
+                stale.append(line)
+            elif iid or named:
+                keep.append(line)
+            else:
+                counts["cleared"] += 1
+        with open(queue_file, "w", encoding="utf-8") as queue:
+            queue.write("".join(keep))
+            queue.flush()
+            os.fsync(queue.fileno())
+        counts.update(copied=len(lines), kept=len(keep), retained=len(stale))
+    if stale:
+        retain_stale(queue_file, stale)
+    return counts
 
 
 def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
@@ -424,10 +579,10 @@ def _notify_recovery(data_dir: Path, agent_name: str):
 
 
 _IDENTITY_HINT = (
-    " (If this is a multi-instance session, reclaim your previous identity from "
-    "your context window, NOT from the chat history before responding. If you "
-    "didn't have one, tell the user to give you a name by clicking your status "
-    "pill at the top.)"
+    " (This is a multi-instance session: your identity is the [identity: ...] breadcrumb "
+    "on chat_read, and it does not change when other agents join or leave. Use "
+    "it as your sender, not a name from the chat history. Only a human renames "
+    "agents, by clicking the status pill at the top.)"
 )
 
 
@@ -554,10 +709,25 @@ class _WakeHold:
         queue_file.with_suffix('.hold.json').unlink(missing_ok=True)
 
 
+def _queue_has_bytes(path: Path) -> bool:
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10, ready_flag=None, get_identity_id_fn=None):
-    """Poll queue file and inject an MCP read task when triggered."""
+                   refresh_interval: int = 10, ready_flag=None, get_identity_id_fn=None,
+                   owns_queue_fn=None):
+    """Poll queue file and inject an MCP read task when triggered.
+
+    `owns_queue_fn(name) -> bool` is the ownership fence (ad-e5gz F1): before
+    reading a non-empty queue - and so before any injection, acknowledgement,
+    attempt journal or hold record - the server must confirm that this
+    wrapper's token owns the queue's name. One call per batch, none while the
+    queue is empty. Unconfirmed (stale token, someone else's name, server
+    unreachable): the batch stays queued, untouched."""
     hold_check = getattr(inject_fn, 'hold_check', None)  # absent on Windows, whose flow is unchanged
     hold = _WakeHold(lambda channel, text: _post_hold_notice(
         server_port, get_token_fn() if get_token_fn else "", channel, text))
@@ -571,6 +741,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
     reason = None  # of an uncertain disposition, for the journal (ad-ruq); a fixed label, never prompt text
     pending_prompt = ''
     prompt_key = None
+    own_identity = ""   # this batch's consumer identity, named in its delivery rows (ad-e5gz)
     while True:
         try:
             # Ready gate (TD-006, #3925.2): while the gate is held the watcher
@@ -579,7 +750,11 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 time.sleep(1)
                 continue
             if not pending:
-                _, pending_file = get_identity_fn()
+                queue_name, pending_file = get_identity_fn()
+                if owns_queue_fn is not None and _queue_has_bytes(pending_file):
+                    if not owns_queue_fn(queue_name):
+                        time.sleep(1)
+                        continue
                 pending = read_batch(pending_file)
                 attempts = 0
                 disposition = ''
@@ -591,7 +766,8 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
             if pending:
                 # A failed acknowledgement after a paste must never paste again.
                 if disposition:
-                    finish_batch(pending_file, pending, disposition, attempts, reason=reason)
+                    finish_batch(pending_file, pending, disposition, attempts, reason=reason,
+                                 identity_id=own_identity or None)
                     pending = []
                     continue
 
@@ -720,14 +896,16 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         raised = True
                     if result is HELD:
                         # The screen changed after the hold check: nothing typed, so nothing was used up.
-                        finish_batch(pending_file, pending, 'held', attempts, consume=False)
+                        finish_batch(pending_file, pending, 'held', attempts, consume=False,
+                                     identity_id=own_identity or None)
                         hold.held(pending_file, current_name, 'changed-before-paste', pending)
                         last_rules_epoch, first_mention = before_compose
                         if trigger_flag is not None:
                             trigger_flag[0] = False
                         pending = []
                     elif result is False and attempts < 3:
-                        if finish_batch(pending_file, pending, 'not-pasted', attempts, consume=False) is False:
+                        if finish_batch(pending_file, pending, 'not-pasted', attempts, consume=False,
+                                        identity_id=own_identity or None) is False:
                             pending = []  # another consumer replaced/acknowledged this batch
                     else:
                         # tmux taking the keys is not the agent reading them: never call this delivered.
@@ -737,11 +915,13 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         # an injector that raised or an older injector (Windows) gives none or 'inject-raised'.
                         reason = getattr(result, 'reason', None) if result is not None else 'inject-raised' if raised else None
                         hold.release(pending_file)  # only now: a later HELD must keep the hold's age
-                        finish_batch(pending_file, pending, disposition, attempts, reason=reason)
+                        finish_batch(pending_file, pending, disposition, attempts, reason=reason,
+                                     identity_id=own_identity or None)
                         pending = []
                 else:
                     disposition = 'ignored'
-                    finish_batch(pending_file, pending, disposition, attempts)
+                    finish_batch(pending_file, pending, disposition, attempts,
+                                 identity_id=own_identity or None)
                     pending = []
         except Exception:
             pass
@@ -772,6 +952,9 @@ def main():
     parser.add_argument("agent", choices=agent_names, help=f"Agent to wrap ({', '.join(agent_names)})")
     parser.add_argument("--no-restart", action="store_true", help="Do not restart on exit")
     parser.add_argument("--label", type=str, default=None, help="Custom display label")
+    parser.add_argument("--name", type=str, default=None,
+                        help="Ask for this exact identity (a returning controller's own name); "
+                             "exits if it is live or its slot is held, never takes another name")
     # Per-project isolation flags (must match the server's flags so wrappers
     # launched separately connect to the right instance). Values are consumed
     # by apply_cli_overrides() above; listing here so --help shows them.
@@ -845,13 +1028,22 @@ def main():
     server_port = config.get("server", {}).get("port", 8300)
     mcp_cfg = config.get("mcp", {})
 
-    try:
-        registration = _register_instance(server_port, agent, args.label,
-                                          ready_gate=args.ready_gate)
-    except Exception as exc:
-        print(f"  Registration failed ({exc}).")
-        print("  Wrapper cannot continue without a registered identity.")
-        sys.exit(1)
+    if args.name:
+        try:
+            registration = _register_named(server_port, agent, args.label,
+                                           args.ready_gate, args.name)
+        except RegistrationRefused as exc:
+            print(f"  Registration as {args.name} refused ({exc}).")
+            print("  A named launch never takes another name; no queue or session was touched.")
+            sys.exit(1)
+    else:
+        try:
+            registration = _register_instance(server_port, agent, args.label,
+                                              ready_gate=args.ready_gate)
+        except Exception as exc:
+            print(f"  Registration failed ({exc}).")
+            print("  Wrapper cannot continue without a registered identity.")
+            sys.exit(1)
 
     assigned_name = registration["name"]
     assigned_token = registration["token"]
@@ -981,8 +1173,28 @@ def main():
         return changed
 
     queue_file = _identity["queue"]
-    if queue_file.exists():
-        queue_file.write_text("", "utf-8")
+    disposed = _dispose_queue_at_start(queue_file, _identity["identity_id"], named=bool(args.name))
+    if disposed["copied"]:
+        print(f"  Queue at start: {disposed['copied']} line(s) copied to "
+              f"{queue_file.with_suffix('.startup.jsonl').name}; kept {disposed['kept']}, "
+              f"retained {disposed['retained']} for a retired identity, cleared {disposed['cleared']}")
+
+    # Ownership fence (ad-e5gz F1): the queue watcher asks before every batch;
+    # this records the state so a change is said once, visibly.
+    _fence = {"open": True, "said": None}
+
+    def _owns_queue(queue_name):
+        verdict = _check_queue_owner(server_port, queue_name, get_token())
+        if verdict == "owner":
+            if not _fence["open"]:
+                print(f"  Ownership of @{queue_name} confirmed; mention delivery reopened")
+            _fence.update(open=True, said=None)
+            return True
+        if _fence["open"] or _fence["said"] != verdict:
+            print(f"  Mention delivery held: the server does not confirm this wrapper owns "
+                  f"@{queue_name} ({verdict}); the queue stays untouched")
+        _fence.update(open=False, said=verdict)
+        return False
 
     strip_vars = {"CLAUDECODE"} | set(agent_cfg.get("strip_env", []))
     env = {k: v for k, v in os.environ.items() if k not in strip_vars}
@@ -1029,6 +1241,8 @@ def main():
     print(f"  @{assigned_name} mentions auto-inject MCP reads")
     print(f"  Starting {command} in {cwd}...\n")
 
+    _recovery_said = [None]   # last refusal code printed by the 409 recovery
+
     def _heartbeat():
         while True:
             # Ready gate (TD-006): no heartbeats while the gate is held - a
@@ -1064,9 +1278,25 @@ def main():
                     set_runtime_identity(server_name)
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
+                    # 409 recovery keeps the name, behind the fence (ad-e5gz
+                    # change 7): the fence closes first, then the wrapper asks
+                    # for its CURRENT name (an alias included). If that is
+                    # refused it never takes another name - that would be an
+                    # automatic rename - and keeps asking, saying so once.
+                    current_name, _ = get_identity()
+                    if _fence["open"]:
+                        print(f"  Session for @{current_name} is stale (409); mention delivery held")
+                    _fence.update(open=False, said="stale")
                     try:
-                        replacement = _register_instance(server_port, agent, args.label,
-                                                         ready_gate=args.ready_gate)
+                        replacement = _register_named(server_port, agent, args.label,
+                                                      args.ready_gate, current_name)
+                    except RegistrationRefused as refusal:
+                        if _recovery_said[0] != refusal.code:
+                            print(f"  Recovery: cannot re-register as {current_name} ({refusal}); "
+                                  "not taking another name, retrying")
+                            _recovery_said[0] = refusal.code
+                    else:
+                        _recovery_said[0] = None
                         set_runtime_identity(replacement["name"], replacement["token"],
                                              replacement.get("identity_id"))
                         # Ready gate (#3925.3): the replacement identity starts
@@ -1076,8 +1306,7 @@ def main():
                         if ready_gate_cfg:
                             _ready_flag[0] = False
                         _notify_recovery(data_dir, replacement["name"])
-                    except Exception:
-                        pass
+                        print(f"  Recovered as @{current_name} with a new session")
                 time.sleep(5)
                 continue
             except Exception:
@@ -1104,7 +1333,8 @@ def main():
                     "server_port": server_port, "agent_name": assigned_name,
                     "get_token_fn": get_token, "refresh_interval": _refresh_interval,
                     "ready_flag": _ready_flag if ready_gate_cfg else None,
-                    "get_identity_id_fn": get_identity_id},
+                    "get_identity_id_fn": get_identity_id,
+                    "owns_queue_fn": _owns_queue},
             daemon=True,
         )
         _watcher_thread.start()
@@ -1123,7 +1353,8 @@ def main():
                             "server_port": server_port, "agent_name": assigned_name,
                             "get_token_fn": get_token, "refresh_interval": _refresh_interval,
                             "ready_flag": _ready_flag if ready_gate_cfg else None,
-                            "get_identity_id_fn": get_identity_id},
+                            "get_identity_id_fn": get_identity_id,
+                            "owns_queue_fn": _owns_queue},
                     daemon=True,
                 )
                 _watcher_thread.start()

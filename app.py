@@ -23,7 +23,7 @@ from jobs import JobStore
 from schedules import ScheduleStore, parse_schedule_spec
 from router import Router
 from agents import AgentTrigger, strict_wake_response
-from registry import RuntimeRegistry
+from registry import IDENTITY_CONTRACT, NameUnavailable, RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
 
@@ -415,18 +415,6 @@ def configure(cfg: dict, session_token: str = ""):
                         if result:
                             mcp_bridge.purge_identity(name)
                             registry.clean_renames_for(name)
-                            renamed = result.get("_renamed_back")
-                            if renamed:
-                                mcp_bridge.migrate_identity(renamed["old"], renamed["new"])
-                                store.rename_sender(renamed["old"], renamed["new"])
-                                _migrate_agent_last_channel(renamed["old"], renamed["new"])
-                                if _event_loop:
-                                    rename_event = json.dumps({
-                                        "type": "agent_renamed",
-                                        "old_name": renamed["old"],
-                                        "new_name": renamed["new"],
-                                    })
-                                    asyncio.run_coroutine_threadsafe(_broadcast(rename_event), _event_loop)
                             store.add(name, f"{name} disconnected (timeout)", msg_type="leave", channel=_agent_last_channel.get(name, _last_active_channel))
                             _posted_leave.add(name)
 
@@ -927,10 +915,16 @@ async def _route_targets(targets, chat_msg, channel, custom_prompt="",
         # Session guard: suppress out-of-turn agent triggers
         if allowed_agent and target != allowed_agent:
             continue
+        # Exact-name routing (ad-e5gz, invariant I3): a name with no live
+        # instance is not expanded to another family member, and nothing is
+        # queued for it, so say exactly that instead of "message queued".
+        if not agents.is_available(target):
+            store.add("system", f"@{target} is not connected: not delivered",
+                      msg_type="system", channel=channel)
+            continue
         if not mcp_bridge.is_online(target):
             store.add("system", f"{target} appears offline — message queued.", msg_type="system", channel=channel)
-        if agents.is_available(target):
-            await agents.trigger(target, message=chat_msg, channel=channel, prompt=custom_prompt)
+        await agents.trigger(target, message=chat_msg, channel=channel, prompt=custom_prompt)
 
 
 # --- broadcasting ---
@@ -2306,7 +2300,15 @@ async def register_agent(request: Request):
     if not base:
         return JSONResponse({"error": "base is required"}, status_code=400)
     ready_gate = bool(body.get("ready_gate", False))
-    result = registry.register(base, label, ready_gate=ready_gate)
+    # A returning wrapper may ask for its own name (ad-e5gz). The grant is
+    # atomic in the registry; a refusal touches no instance.
+    requested = body.get("name")
+    try:
+        result = registry.register(base, label, ready_gate=ready_gate,
+                                   name=requested if requested else None)
+    except NameUnavailable as exc:
+        status = 409 if exc.code in ("name_in_use", "slot_in_use") else 400
+        return JSONResponse({"error": exc.code, "detail": exc.message}, status_code=status)
     if result is None:
         return JSONResponse({"error": f"unknown base: {base}"}, status_code=400)
     import mcp_bridge
@@ -2316,19 +2318,6 @@ async def register_agent(request: Request):
             mcp_bridge._presence[result["name"]] = __import__("time").time()
     # Ready gate (TD-006): a starting instance gets NO presence touch - it
     # must not appear online until the authenticated ready transition.
-    # If slot 1 was renamed (e.g. "claude" → "claude-1"), migrate state
-    renamed = result.pop("_renamed_slot1", None)
-    if renamed:
-        mcp_bridge.migrate_identity(renamed["old"], renamed["new"])
-        store.rename_sender(renamed["old"], renamed["new"])
-        _migrate_agent_last_channel(renamed["old"], renamed["new"])
-        if _event_loop:
-            rename_event = json.dumps({
-                "type": "agent_renamed",
-                "old_name": renamed["old"],
-                "new_name": renamed["new"],
-            })
-            asyncio.run_coroutine_threadsafe(_broadcast(rename_event), _event_loop)
     # Broadcast pending_instance event so UI can show naming lightbox
     if result.get("state") == "pending" and _event_loop:
         pending_event = json.dumps({
@@ -2340,6 +2329,16 @@ async def register_agent(request: Request):
         })
         asyncio.run_coroutine_threadsafe(_broadcast(pending_event), _event_loop)
     return JSONResponse(result)
+
+
+@app.get("/api/register/capabilities")
+async def register_capabilities():
+    """What this server's registration honours, read by a wrapper BEFORE it
+    sends a named registration (ad-e5gz F3). Loopback-only and token-free,
+    like /api/register: a wrapper has no browser session token. A server
+    without this route answers 404, and the wrapper then sends no named
+    registration (an old server would treat it as an ordinary one)."""
+    return {"identity_contract": IDENTITY_CONTRACT}
 
 
 def _instance_token_auth(request: Request, name: str):
@@ -2426,23 +2425,11 @@ async def deregister_agent(name: str, request: Request):
     result = registry.deregister(name)
     if result is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    # Clean up runtime state (presence, activity, cursors, rename chains)
+    # Clean up runtime state (presence, activity, cursors, rename chains).
+    # A departure renames nobody (ad-e5gz): the other instances keep their names.
     import mcp_bridge
     mcp_bridge.purge_identity(name)
     registry.clean_renames_for(name)
-    # If the remaining instance was renamed back (e.g. "claude-1" → "claude"), migrate state
-    renamed = result.pop("_renamed_back", None)
-    if renamed:
-        mcp_bridge.migrate_identity(renamed["old"], renamed["new"])
-        store.rename_sender(renamed["old"], renamed["new"])
-        _migrate_agent_last_channel(renamed["old"], renamed["new"])
-        if _event_loop:
-            rename_event = json.dumps({
-                "type": "agent_renamed",
-                "old_name": renamed["old"],
-                "new_name": renamed["new"],
-            })
-            asyncio.run_coroutine_threadsafe(_broadcast(rename_event), _event_loop)
     return JSONResponse({"ok": True})
 
 
@@ -2487,8 +2474,10 @@ async def rename_agent_label(name: str, request: Request):
 async def heartbeat(agent_name: str, request: Request):
     """Wrapper calls this to keep presence alive and report activity.
 
-    Returns the canonical name from the registry so the wrapper can
-    detect renames (e.g. claim renamed 'claude-2' to 'claude-music').
+    For an authenticated wrapper the reply name is the token's own instance
+    name (ad-e5gz, invariant I2), so a human rename still reaches the wrapper
+    (the rename moves the instance in place) while no rename mapping, family
+    lookup or other instance's presence can redirect it.
     """
     import mcp_bridge
     auth_inst = _resolve_authenticated_agent(request)
@@ -2515,29 +2504,9 @@ async def heartbeat(agent_name: str, request: Request):
     # Immediately broadcast on activity state change (don't wait for background checker)
     if _activity_changed:
         await broadcast_status()
-    # Return canonical name so wrapper can track renames
     resp = {"ok": True, "name": current_name}
-    if registry:
-        # Follow rename chain (e.g. claude-2 was renamed to claude-music)
-        canonical = registry.resolve_name(current_name)
-        inst = registry.get_instance(canonical)
-        # If rename chain didn't help, try family-based lookup
-        # (handles case where _renames was cleared by server restart but
-        # the instance was claimed/renamed via MCP)
-        if not inst:
-            base = current_name.split("-")[0] if "-" in current_name else current_name
-            family_inst = registry.get_family_instance(base)
-            if family_inst:
-                inst = family_inst
-                canonical = inst["name"]
-        if inst:
-            resp["name"] = inst["name"]
-            resp["pending"] = inst.get("state") == "pending"
-            # Also update presence under the canonical name
-            if canonical != current_name:
-                now = __import__("time").time()
-                with mcp_bridge._presence_lock:
-                    mcp_bridge._presence[canonical] = now
+    if auth_inst:
+        resp["pending"] = auth_inst.get("state") == "pending"
     return resp
 
 

@@ -66,13 +66,13 @@ _MCP_INSTRUCTIONS = (
     "  - All Kilo products (Kilo CLI, kilocode, etc.) → base: \"kilo\"\n"
     "  - Humans use their own name (e.g. \"user\")\n"
     "Do NOT use your CLI tool name (e.g. \"gemini-cli\", \"claude-code\") — use the base name above.\n"
-    "IMPORTANT: When multiple instances run, the server renames slot 1 (e.g. \"claude\" → \"claude-1\"). "
+    "IMPORTANT: Your session is bound to one identity. Its name never changes when other agents join, "
+    "leave or restart; only a human can rename you. The [identity: ...] breadcrumb on chat_read shows it. "
     "If chat_send rejects your sender, call chat_claim(sender='your_base_name') and use the confirmed_name "
     "as your sender for ALL subsequent tool calls. The confirmed_name overrides the base name.\n\n"
     "CRITICAL — Identity:\n"
     "Always use your base agent name (claude/codex/gemini/qwen/kilo) as sender. "
-    "Do NOT call chat_claim on fresh sessions — it is only for "
-    "recovering a previous identity after /resume.\n\n"
+    "Do NOT call chat_claim on fresh sessions. /resume keeps your identity, so no claim is needed after it.\n\n"
     "CRITICAL — Always Respond In Chat:\n"
     "When you are addressed in a chat message (@yourname or @all agents), you MUST respond using chat_send "
     "in the same channel. NEVER respond only in your terminal/console output. The human and other agents "
@@ -96,9 +96,9 @@ _MCP_INSTRUCTIONS = (
     "and execute it directly. Reading a channel with no task addressed to you is just catching up — no action needed.\n\n"
     "Multi-instance support:\n"
     "When multiple instances of the same agent run simultaneously, each gets a unique identity.\n"
-    "The server assigns names like claude-1, claude-2 automatically.\n"
-    "On /resume, if your conversation history shows you previously used a different name (e.g. 'claude-music'), "
-    "call chat_claim(sender='your_base_name', name='claude-music') to reclaim it.\n"
+    "The first instance of a family is named after it (claude); later ones get claude-2, claude-3, and keep "
+    "those names. A mention reaches only the agent with exactly that name.\n"
+    "You cannot rename yourself with chat_claim; a human renames agents in the web UI.\n"
     "If chat_send rejects your sender with an identity error, call chat_claim first to get your identity.\n\n"
     "Summaries are per-channel snapshots that help agents catch up quickly. "
     "Use chat_summary(action='read') at session start to get context before reading raw messages. "
@@ -1021,20 +1021,25 @@ def chat_set_hat(sender: str, svg: str, target: str = "", ctx: Context | None = 
 
 
 def chat_claim(sender: str, name: str = "", ctx: Context | None = None) -> str:
-    """Claim your identity in a multi-instance setup.
+    """Confirm your identity in a multi-instance setup.
 
-    - Without name: accept the auto-assigned identity and unlock chat_send.
-    - With name: reclaim a previous identity (e.g. from a breadcrumb after /resume).
+    - Without name (or with your own current name): confirm the identity your
+      session holds and unlock chat_send.
+    - An authenticated session cannot rename itself with name=...: a human
+      renames agents in the web UI. /resume keeps your identity; no claim needed.
 
-    Your sender must be your current registered name (the one assigned at registration).
     The identity breadcrumb in chat_read responses shows your current identity."""
+    # An authenticated caller IS its token's instance (ad-e5gz, invariant I2):
+    # claim resolves exactly that instance and only confirms it - no family
+    # matching, and no self-rename (a human renames in the web UI).
+    authenticated = _authenticated_instance(ctx) is not None
     sender, err = _resolve_tool_identity(sender, ctx, field_name="sender", required=True)
     if err:
         return err
     if not registry:
         return "Error: registry not available."
     target = name.strip() if name.strip() else None
-    result = registry.claim(sender, target)
+    result = registry.claim(sender, target, exact=authenticated)
     if isinstance(result, str):
         return f"Error: {result}"
     # Touch presence with the CONFIRMED name (may differ from sender)

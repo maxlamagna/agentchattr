@@ -81,7 +81,7 @@ def begin_batch(path, lines, attempts):
         os.replace(tmp, journal)
 
 
-def _finish_locked(path, queue, lines, status, attempts, consume=True, reason=None):
+def _finish_locked(path, queue, lines, status, attempts, consume=True, reason=None, identity_id=None):
     prefix = ''.join(lines)
     queue.seek(0)
     current = queue.read()
@@ -92,6 +92,8 @@ def _finish_locked(path, queue, lines, status, attempts, consume=True, reason=No
         record['delivery_outcome'] = status
     if reason:
         record['reason'] = reason
+    if identity_id:
+        record['identity_id'] = identity_id   # the consuming instance (ad-e5gz migration check)
     with open(path.with_suffix('.delivery.jsonl'), 'a', encoding='utf-8') as trace:
         trace.write(json.dumps(record) + '\n')
         trace.flush()
@@ -133,14 +135,15 @@ def retain_stale(path, lines):
             os.fsync(trace.fileno())
 
 
-def finish_batch(path, lines, status, attempts, *, consume=True, reason=None):
+def finish_batch(path, lines, status, attempts, *, consume=True, reason=None, identity_id=None):
     """Keep concurrent appends; retain uncertain/exhausted deliveries for manual recovery.
 
     The trace contains hashes/counts rather than prompt text, plus `reason`, a fixed label naming
-    why a delivery ended uncertain (ad-ruq), when the injector gave one. Only a proven pre-paste
+    why a delivery ended uncertain (ad-ruq), when the injector gave one, and `identity_id`, the
+    consuming wrapper's own identity, when it has one (ad-e5gz). Only a proven pre-paste
     refusal is retryable. An ambiguous result is preserved, never automatically resent.
     False means another consumer changed the prefix; the caller must read a fresh batch.
     """
     with queue_lock(path):
         with open(path, 'r+', encoding='utf-8') as queue:
-            return _finish_locked(path, queue, lines, status, attempts, consume, reason)
+            return _finish_locked(path, queue, lines, status, attempts, consume, reason, identity_id)

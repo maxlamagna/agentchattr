@@ -249,7 +249,8 @@ class Wrapper:
     def __init__(self, tmp: Path, server: Server, *, agent: str = "claude",
                  scenario: list[str], gated: bool = True,
                  pattern: str = "READY>", blockers: tuple = (),
-                 ready_timeout: int = 30, no_restart: bool = True):
+                 ready_timeout: int = 30, no_restart: bool = True,
+                 extra_args: tuple = ()):
         Wrapper._counter += 1
         self.agent = agent
         self.dir = Path(tmp) / f"wrapper-{Wrapper._counter}"
@@ -275,6 +276,7 @@ class Wrapper:
                      "--ready-timeout", str(ready_timeout)]
             for spec in blockers:
                 argv += ["--ready-blocker", spec]
+        argv += list(extra_args)          # e.g. ("--name", "claude") (ad-e5gz)
 
         self.log_path = self.dir / "wrapper.log"
         self._log_fh = open(self.log_path, "wb")

@@ -8,12 +8,31 @@ Thread-safe: a single threading.Lock guards all mutations.
 
 import colorsys
 import json
+import re
 import secrets
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# The identity contract (ad-e5gz): a live instance's name changes only by an explicit human
+# rename. Joins, leaves, crashes and restarts never rename anyone; a returning wrapper may ask
+# for its own name, and gets it only if no live instance holds that name or its (base, slot).
+IDENTITY_CONTRACT = 2
+
+# The shape a human rename produces (/api/label sanitises to it); a requested name must have it.
+_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
+
+
+class NameUnavailable(Exception):
+    """A named registration that cannot be granted. `code` is the API error:
+    name_in_use | slot_in_use | family_conflict | invalid_name."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 @dataclass
@@ -184,11 +203,20 @@ class RuntimeRegistry:
     # --- Registration ---
 
     def register(self, base: str, label: str | None = None,
-                 ready_gate: bool = False) -> dict | None:
+                 ready_gate: bool = False, name: str | None = None) -> dict | None:
         """Register a new instance of `base`. Returns slot info or None if unknown base.
 
-        When a 2nd instance registers, slot 1 is renamed from 'base' to 'base-1'
-        to prevent identity ambiguity. The rename info is returned as '_renamed_slot1'.
+        Registration never renames an existing instance (ad-e5gz, invariant I1).
+        Without `name` the new instance takes the lowest free, unreserved slot:
+        'base' for slot 1, 'base-N' otherwise.
+
+        With `name` (a returning wrapper asking for its own name), the name is
+        granted atomically only if (a) no live instance has it, (b) for 'base' or
+        'base-N', no live instance holds that (base, slot) coordinate, and (c) it
+        does not stomp another family. A custom alias takes the lowest free
+        unreserved slot of its family. The 30 s grace reservation of that exact
+        name is ignored: naming it at launch is the operator's authorisation.
+        Otherwise NameUnavailable is raised and nothing is touched.
 
         `ready_gate=True` (TD-006 opt-in): the instance starts in "starting"
         instead of "active" - identity and token are issued (the CLI's MCP
@@ -200,64 +228,67 @@ class RuntimeRegistry:
                 return None
 
             self._expire_reserved()
+            base_cfg = self._bases[base]
 
-            # Find next free slot
             taken = {i.slot for i in self._instances.values() if i.base == base}
             reserved = set()
             for rn in self._reserved:
+                if rn == name:
+                    continue
                 rb, rs = self._parse_name(rn)
                 if rb == base:
                     reserved.add(rs)
 
-            slot = 1
-            while slot in taken or slot in reserved:
-                slot += 1
+            def lowest_free_slot():
+                slot = 1
+                while slot in taken or slot in reserved:
+                    slot += 1
+                return slot
 
-            # When a 2nd instance registers, rename slot-1 from "base" to "base-1"
-            # so that no instance shares a name with the base family.  This prevents
-            # a second instance from sending messages as "base" (identity theft).
-            renamed_slot1 = None
-            if slot >= 2 and base in self._instances:
-                slot1 = self._instances[base]
-                if slot1.base == base and slot1.slot == 1:
-                    new_s1_name = f"{base}-1"
-                    del self._instances[base]
-                    slot1.name = new_s1_name
-                    base_cfg = self._bases[base]
-                    slot1.label = f"{base_cfg.get('label', base.capitalize())} 1"
-                    # Color stays the same (slot 1 = base color)
-                    self._instances[new_s1_name] = slot1
-                    self._renames[base] = new_s1_name
-                    renamed_slot1 = {"old": base, "new": new_s1_name}
+            if name is None:
+                slot = lowest_free_slot()
+                name = base if slot == 1 else f"{base}-{slot}"
+                numbered = True
+            else:
+                if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+                    raise NameUnavailable("invalid_name", f"'{name}' is not a valid agent name")
+                if (family_err := self._conflicts_with_other_family(name, base)):
+                    raise NameUnavailable("family_conflict", family_err)
+                if name in self._instances:
+                    raise NameUnavailable("name_in_use", f"'{name}' is held by a live instance")
+                t_base, t_slot = self._parse_name(name)
+                numbered = t_base == base
+                if numbered:
+                    if t_slot in taken:
+                        raise NameUnavailable(
+                            "slot_in_use", f"slot {t_slot} of {base} is held by a live instance")
+                    slot = t_slot
+                else:
+                    slot = lowest_free_slot()
+                self._reserved.pop(name, None)
 
-            name = base if slot == 1 else f"{base}-{slot}"
-            base_cfg = self._bases[base]
             color = _derive_color(base_cfg.get("color", "#888"), slot)
-
             if label:
                 lbl = label
+            elif not numbered:
+                lbl = name
             elif slot == 1:
                 lbl = base_cfg.get("label", base.capitalize())
             else:
                 lbl = f"{base_cfg.get('label', base.capitalize())} {slot}"
 
-            # Fresh registrations are immediately authoritative. Identity
-            # recovery/reclaim still uses chat_claim, but normal startup should
-            # not block on a manual confirmation step. Under the opt-in ready
-            # gate the instance instead enters "starting" (see register docstring).
+            # Fresh registrations are immediately authoritative. Under the opt-in
+            # ready gate the instance instead enters "starting" (see docstring).
             state = "starting" if ready_gate else "active"
             inst = Instance(name=name, base=base, slot=slot, label=lbl, color=color, state=state)
             self._instances[name] = inst
-            # Fresh registration (plus any slot-1 rename above) supersedes reclaimable
-            # identities sharing those names/(base, slot) coordinates — including custom
-            # aliases that don't match `name`. Enforces fresh-wins by coordinate, not name.
+            # Fresh registration supersedes reclaimable identities sharing its name or
+            # (base, slot) coordinate — including custom aliases that don't match
+            # `name`. Enforces fresh-wins by coordinate, not name.
             self._evict_reclaimable_collisions_locked()
             result = _inst_dict(inst, include_token=True)
-            if renamed_slot1:
-                result["_renamed_slot1"] = renamed_slot1
 
         self._notify()
-        self._save_renames()
         self._save_instances()
         return result
 
@@ -274,8 +305,8 @@ class RuntimeRegistry:
             silently reviving a dead session — reclaim is only wanted for sleep,
             not for closing the server or an agent.
 
-        Returns result dict with 'ok' and optional '_renamed_back' info,
-        or None if instance not found.
+        Returns {"ok": True}, or None if instance not found. A departure never
+        renames the remaining instances (ad-e5gz, invariant I1).
         """
         return self._remove_instance(name, reserve=True, reclaimable=reclaimable)
 
@@ -284,10 +315,8 @@ class RuntimeRegistry:
         """Shared removal path (deregister + cancel_starting).
 
         The reservation is optional: the ready gate's cancel skips it so an
-        immediate relaunch reacquires the same name (TD-006). Family rename-back
-        bookkeeping ALWAYS runs - a removal path that skipped it could strand a
-        'base-1' name after its sibling died (#3925.4). `require_state` makes
-        check-and-remove atomic under one lock acquisition.
+        immediate relaunch reacquires the same name (TD-006). `require_state`
+        makes check-and-remove atomic under one lock acquisition.
         """
         with self._lock:
             inst_removed = self._instances.get(name)
@@ -295,48 +324,16 @@ class RuntimeRegistry:
                 return None
             if require_state is not None and inst_removed.state != require_state:
                 return None
-            base = inst_removed.base
             del self._instances[name]
             if reserve:
                 self._reserved[name] = time.time()
             if reclaimable:
                 self._reclaimable[name] = inst_removed  # token recoverable on reconnect (sleep)
-
-            renamed_back = self._rename_back_if_single_locked(base)
-
-            # A rename-back may have moved a live instance onto a (base, slot) that the
-            # just-removed identity still occupies in _reclaimable — drop such stale
-            # collisions so they can't outlive the live identity across a restart.
             self._evict_reclaimable_collisions_locked()
 
         self._notify()
-        self._save_renames()
         self._save_instances()
-        result = {"ok": True}
-        if renamed_back:
-            result["_renamed_back"] = renamed_back
-        return result
-
-    def _rename_back_if_single_locked(self, base: str) -> dict | None:
-        """If the family drops to 1 instance with a numbered name, rename it
-        back to the bare base name. Caller holds self._lock."""
-        renamed_back = None
-        family = [i for i in self._instances.values() if i.base == base]
-        if len(family) == 1:
-            remaining = family[0]
-            r_base, r_slot = self._parse_name(remaining.name)
-            if r_base == base and remaining.name != base:
-                old_name = remaining.name
-                del self._instances[old_name]
-                remaining.name = base
-                remaining.slot = 1
-                base_cfg = self._bases.get(base, {})
-                remaining.label = base_cfg.get("label", base.capitalize())
-                remaining.color = _derive_color(base_cfg.get("color", "#888"), 1)
-                self._instances[base] = remaining
-                self._renames[old_name] = base
-                renamed_back = {"old": old_name, "new": base}
-        return renamed_back
+        return {"ok": True}
 
     # --- Ready gate (TD-006) ---
 
@@ -378,7 +375,8 @@ class RuntimeRegistry:
 
     # --- Identity Claim ---
 
-    def claim(self, sender: str, target_name: str | None = None) -> dict | str:
+    def claim(self, sender: str, target_name: str | None = None,
+              exact: bool = False) -> dict | str:
         """Claim an identity. Returns instance dict on success, error string on failure.
 
         Family-based matching: sender can be a base family name (e.g. 'claude')
@@ -387,7 +385,13 @@ class RuntimeRegistry:
         - sender='claude', no target: assign first unclaimed claude instance
         - sender='claude', target='claude-music': assign unclaimed instance AND rename
         - sender='claude-2' (exact match): confirm that specific instance
+
+        `exact=True` (an authenticated caller, ad-e5gz invariant I2): `sender` is
+        the token's own instance. Only that instance is resolved - no family
+        matching, no reclaim of another record - and it is only confirmed.
         """
+        if exact:
+            return self._confirm_own_instance(sender, target_name)
         error = None
         result = None
         with self._lock:
@@ -481,6 +485,33 @@ class RuntimeRegistry:
         self._notify()
         self._save_renames()
         self._save_instances()
+        return result
+
+    def _confirm_own_instance(self, name: str, target_name: str | None) -> dict | str:
+        """claim(exact=True): confirm the caller's own live instance and nothing else.
+
+        The own-name form (target == name) activates a pending record, as the
+        breadcrumb reclaim did; the plain form only reports it. Any other target
+        is a self-rename, which is refused: a human renames in the web UI.
+        """
+        activated = False
+        with self._lock:
+            inst = self._instances.get(name)
+            if not inst:
+                return f"No live instance named {name}."
+            if inst.state == "starting":
+                return (f"{inst.name} is starting (ready gate); "
+                        "claim is not allowed until it is ready")
+            if target_name is not None and target_name != inst.name:
+                return (f"{inst.name} cannot rename itself to {target_name} by claim; "
+                        "a human renames agents in the web UI (status pill)")
+            if target_name is not None and inst.state == "pending":
+                inst.state = "active"
+                activated = True
+            result = _inst_dict(inst)
+        if activated:
+            self._notify()
+            self._save_instances()
         return result
 
     def confirm_pending(self, name: str) -> bool:
@@ -673,33 +704,15 @@ class RuntimeRegistry:
                 for i in self._instances.values()
             )
 
-    def get_family_instance(self, base: str) -> dict | None:
-        """Return the instance dict for a family if exactly one exists.
-        Used by heartbeat to find renamed instances after server restart."""
-        with self._lock:
-            matches = [i for i in self._instances.values() if i.base == base]
-            if len(matches) == 1:
-                return _inst_dict(matches[0])
-        return None
-
     def resolve_to_instances(self, name: str) -> list[str]:
-        """Resolve a name to actual registered instance names.
+        """Resolve a mention to the instance names it addresses: exactly [name].
 
-        If `name` is a registered instance, returns [name].
-        If `name` is a base family name with no exact match, returns all
-        active instances in that family (e.g. 'claude' → ['claude-prime']).
-        Otherwise returns [name] unchanged (for non-agent names like 'ben').
+        A mention reaches only the instance with exactly that name (ad-e5gz,
+        invariant I3). A base name with no live instance of that name is NOT
+        expanded to other family members; the router reports it undelivered.
+        Kept as a function so every routing call site shares one rule.
         """
-        with self._lock:
-            if name in self._instances:
-                return [name]
-            # Check if it's a base name with registered family members
-            if name in self._bases:
-                members = [i.name for i in self._instances.values()
-                           if i.base == name and i.state == "active"]
-                if members:
-                    return members
-            return [name]
+        return [name]
 
     def resolve_name(self, name: str) -> str:
         """Follow rename chain to find current canonical name."""
@@ -727,6 +740,8 @@ class RuntimeRegistry:
         If the token belongs to a deregistered-but-reclaimable instance (e.g. the agent
         was crash-timed-out while the machine slept), reactivate it transparently rather
         than rejecting it — provided its name has not since been freshly re-registered.
+        The record comes back in its persisted state (ad-e5gz F2): a `starting` record
+        stays `starting`, so only the authenticated mark_ready transition opens routing.
         """
         result = None
         reactivated = False
@@ -746,7 +761,6 @@ class RuntimeRegistry:
                     del self._reclaimable[name]
                     changed = True
                     continue
-                inst.state = "active"
                 self._instances[name] = inst
                 del self._reclaimable[name]
                 self._reserved.pop(name, None)

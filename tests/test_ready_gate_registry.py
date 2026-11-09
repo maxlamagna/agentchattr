@@ -76,17 +76,18 @@ class ReadyGateRegistryTests(unittest.TestCase):
         self.assertEqual(relaunch["name"], "claude")      # no claude-2 (spec D1.5)
         self.assertNotIn("_renamed_slot1", relaunch)
 
-    def test_cancel_starting_second_instance_renames_back(self):
-        """#3925.4: cancel shares deregister's family bookkeeping. claude active
-        + gated claude-2; cancelling claude-2 must rename claude-1 -> claude."""
-        self.reg.register("claude")                            # slot 1, active
-        second = self.reg.register("claude", ready_gate=True)  # slot1 -> claude-1
+    def test_cancel_starting_second_instance_renames_nothing(self):
+        """ad-e5gz (inverts #3925.4's rename-back): claude active + gated
+        claude-2; neither the gated registration nor its cancel renames claude,
+        whose token keeps resolving to the same identity."""
+        first = self.reg.register("claude")                    # slot 1, active
+        second = self.reg.register("claude", ready_gate=True)  # claude stays 'claude'
         self.assertEqual(second["name"], "claude-2")
+        self.assertEqual(self.reg.resolve_token(first["token"])["name"], "claude")
         self.assertTrue(self.reg.cancel_starting("claude-2"))
-        names = set(self.reg.get_all().keys())
-        self.assertIn("claude", names,
-                      "rename-back bookkeeping must run on cancel")
-        self.assertNotIn("claude-1", names)
+        self.assertEqual(set(self.reg.get_all().keys()), {"claude"})
+        self.assertEqual(self.reg.resolve_token(first["token"])["identity_id"],
+                         first["identity_id"])
 
     def test_cancel_starting_refuses_non_starting(self):
         self.reg.register("claude")

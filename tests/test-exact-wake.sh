@@ -138,15 +138,16 @@ def k1():
     d, reg, trig = new_env("K1")
     target = reg.register("codex")
     decoy = reg.register("codex")
-    tname = decoy.get("_renamed_slot1", {}).get("new")
-    check(tname == "codex-1", "K1 unexpected slot-1 rename info %r" % (decoy.get("_renamed_slot1"),))
+    # ad-e5gz: a second registration renames nobody (no slot-1 rename to codex-1).
+    check("_renamed_slot1" not in decoy, "K1 slot-1 rename info %r" % (decoy.get("_renamed_slot1"),))
+    check(decoy["name"] == "codex-2", "K1 decoy name %r" % (decoy["name"],))
     res = trig.trigger_identity(target["identity_id"], "wake and check the job",
                                message="Max: @codex you are mentioned")
-    check(res == {"status": "queued", "target": "codex-1"}, "K1 result %r" % (res,))
+    check(res == {"status": "queued", "target": "codex"}, "K1 result %r" % (res,))
     names = sorted(queue_files(d))
-    check(names == ["codex-1_queue.jsonl"],
+    check(names == ["codex_queue.jsonl"],
           "K1 queue files %r: a family-wide wake happened" % (names,))
-    lines = (d / "codex-1_queue.jsonl").read_text("utf-8").splitlines()
+    lines = (d / "codex_queue.jsonl").read_text("utf-8").splitlines()
     check(len(lines) == 1, "K1 line count %d" % len(lines))
 
 
@@ -156,16 +157,16 @@ def k2():
     decoy = reg.register("codex")
     tid = target["identity_id"]
     r1 = trig.trigger_identity(tid, "first wake prompt", message="Max: hi")
-    check(r1 == {"status": "queued", "target": "codex-1"}, "K2 after the slot-1 rename: %r" % (r1,))
-    check(len((d / "codex-1_queue.jsonl").read_text("utf-8").splitlines()) == 1,
-          "K2 wake did not land in codex-1_queue.jsonl")
-    renamed = reg.rename("codex-1", "codex-alpha")
+    check(r1 == {"status": "queued", "target": "codex"}, "K2 beside a second instance: %r" % (r1,))
+    check(len((d / "codex_queue.jsonl").read_text("utf-8").splitlines()) == 1,
+          "K2 wake did not land in codex_queue.jsonl")
+    renamed = reg.rename("codex", "codex-alpha")
     check(isinstance(renamed, dict), "K2 rename failed: %r" % (renamed,))
     r2 = trig.trigger_identity(tid, "second wake prompt", message="Max: hi again")
     check(r2 == {"status": "queued", "target": "codex-alpha"}, "K2 after a human rename: %r" % (r2,))
     check(len((d / "codex-alpha_queue.jsonl").read_text("utf-8").splitlines()) == 1,
           "K2 wake did not follow the identity into codex-alpha_queue.jsonl")
-    check(len((d / "codex-1_queue.jsonl").read_text("utf-8").splitlines()) == 1,
+    check(len((d / "codex_queue.jsonl").read_text("utf-8").splitlines()) == 1,
           "K2 the abandoned name was written to again")
 
 
@@ -175,11 +176,15 @@ def k3():
     decoy = reg.register("codex")
     tid = target["identity_id"]
     trig.trigger_identity(tid, "wake before leaving", message="Max: hi")
-    reg.deregister("codex-1")
-    check(sorted(reg.get_all_names()) == ["codex"],
-          "K3 live names after the rename-back: %r" % (sorted(reg.get_all_names()),))
-    check(reg.get_instance("codex")["identity_id"] == decoy["identity_id"],
-          "K3 the recycled name does not hold the decoy")
+    reg.deregister("codex")
+    check(sorted(reg.get_all_names()) == ["codex-2"],
+          "K3 live names after the target left: %r" % (sorted(reg.get_all_names()),))
+    # ad-e5gz: nothing is renamed back; a NEW instance recycles the name by asking for it.
+    recycler = reg.register("codex", name="codex")
+    check(reg.get_instance("codex")["identity_id"] == recycler["identity_id"],
+          "K3 the recycled name does not hold the new instance")
+    check(recycler["identity_id"] not in (tid, decoy["identity_id"]),
+          "K3 the recycled name reused an old identity")
     check(reg.resolve_to_instances("codex") == ["codex"],
           "K3 legacy name resolution: %r" % (reg.resolve_to_instances("codex"),))
     before = queue_files(d)
@@ -249,10 +254,10 @@ def k6():
     reg.register("codex")
     res = trig.trigger_identity(target["identity_id"], "wake and check job 42",
                                message="Max: @codex you are mentioned", channel="jobs")
-    check(res == {"status": "queued", "target": "codex-1"}, "K6 result %r" % (res,))
+    check(res == {"status": "queued", "target": "codex"}, "K6 result %r" % (res,))
     names = sorted(queue_files(d))
-    check(names == ["codex-1_queue.jsonl"], "K6 queue files %r" % (names,))
-    lines = (d / "codex-1_queue.jsonl").read_text("utf-8").splitlines()
+    check(names == ["codex_queue.jsonl"], "K6 queue files %r" % (names,))
+    lines = (d / "codex_queue.jsonl").read_text("utf-8").splitlines()
     check(len(lines) == 1, "K6 line count %d" % len(lines))
     if not lines:
         return
@@ -393,8 +398,9 @@ def p2():
     d, reg, trig = new_env("P2")
     reg.register("codex")
     reg.register("codex")
-    check(sorted(reg.resolve_to_instances("codex")) == ["codex-1", "codex-2"],
-          "P2 family expansion changed: %r" % (reg.resolve_to_instances("codex"),))
+    # ad-e5gz deliberately ended family expansion: a name resolves to itself only.
+    check(reg.resolve_to_instances("codex") == ["codex"],
+          "P2 exact-name resolution changed: %r" % (reg.resolve_to_instances("codex"),))
     check(reg.resolve_to_instances("codex-2") == ["codex-2"],
           "P2 exact instance name changed: %r" % (reg.resolve_to_instances("codex-2"),))
 

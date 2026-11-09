@@ -60,7 +60,8 @@ class RuntimeRegistryTests(unittest.TestCase):
 
             resolved_first = registry.resolve_token(first["token"])
             self.assertIsNotNone(resolved_first)
-            self.assertEqual(resolved_first["name"], "claude-1")
+            # ad-e5gz: a second registration no longer renames slot 1 to claude-1.
+            self.assertEqual(resolved_first["name"], "claude")
             self.assertEqual(resolved_first["identity_id"], first["identity_id"])
             self.assertEqual(resolved_first["epoch"], 1)
 

@@ -134,15 +134,18 @@ class SessionReclaimTests(unittest.TestCase):
         """chat_claim must not recover a reclaimable identity whose (base, slot) is live.
 
         Same fresh-wins invariant as register/resolve_token, but at the claim path
-        (_restore_reclaimable_locked). Repro via rename-back: two claude instances, the
-        slot-1 deregisters (→ reclaimable as 'claude-1'), the survivor is renamed back to
-        the canonical 'claude' (slot 1). A later claim('claude-1') must NOT revive the old
-        slot-1 identity on top of the live 'claude' — that would be two active slot-1s.
+        (_restore_reclaimable_locked). Since ad-e5gz nothing renames automatically, so
+        the set-up uses explicit human renames: slot-1 'claude-1' deregisters (→
+        reclaimable), a human renames the survivor onto the canonical 'claude' (slot 1).
+        A later claim('claude-1') must NOT revive the old slot-1 identity on top of the
+        live 'claude' — that would be two active slot-1s.
         """
         self.reg.register("claude")                  # claude (slot 1)
-        self.reg.register("claude")                  # -> claude-1 (slot 1) + claude-2 (slot 2)
-        self.reg.deregister("claude-1", reclaimable=True)              # slot-1 leaves -> reclaimable; claude-2 renamed back to 'claude'
-        self.assertIn("claude", self.reg.get_all_names(), "survivor should be renamed back to canonical 'claude'")
+        self.reg.rename("claude", "claude-1")        # human rename, still slot 1
+        self.reg.register("claude")                  # claude-2 (slot 2)
+        self.reg.deregister("claude-1", reclaimable=True)              # slot-1 leaves -> reclaimable
+        self.reg.rename("claude-2", "claude")        # human rename of the survivor onto slot 1
+        self.assertIn("claude", self.reg.get_all_names())
         self.reg.claim("claude-1")                   # stale wrapper tries to recover its old slot-1 identity
         active_slot1 = [n for n, d in self.reg.get_all().items()
                         if d["base"] == "claude" and d["slot"] == 1 and d["state"] == "active"]
@@ -152,20 +155,20 @@ class SessionReclaimTests(unittest.TestCase):
     def test_live_slot1_token_survives_restart_despite_stale_reclaimable(self):
         """Rename-back + re-register must not strand the current live token on restart.
 
-        6-step repro: register claude (A); register claude (A->'claude-1', B->'claude-2');
-        deregister 'claude-1' (A reclaimable@'claude-1', B renamed back to 'claude');
-        register claude (B->'claude-1', C->'claude-2') — stale A still sits at
-        reclaimable['claude-1']. On restart both instances['claude-1']=B and
-        reclaimable['claude-1']=A were persisted; loading the reclaimable section over
-        the instances section by the same key let stale A overwrite live B, killing B's
-        token and reviving A. The current 'claude-1' wrapper is B; B's token must survive.
+        Original repro (before ad-e5gz) used the automatic slot-1 rename and rename-back
+        to put live B at 'claude-1' while stale A still sat at reclaimable['claude-1'].
+        On restart both instances['claude-1']=B and reclaimable['claude-1']=A were
+        persisted; loading the reclaimable section over the instances section by the
+        same key let stale A overwrite live B. Nothing renames automatically now, so the
+        same collision is built with explicit human renames. B's token must survive.
         """
         a = self.reg.register("claude")              # A = 'claude'
         tok_a = a["token"]
-        b = self.reg.register("claude")              # A -> 'claude-1', B = 'claude-2'
+        self.reg.rename("claude", "claude-1")        # human rename: A = 'claude-1' (slot 1)
+        b = self.reg.register("claude")              # B = 'claude-2'
         tok_b = b["token"]
-        self.reg.deregister("claude-1", reclaimable=True)              # A reclaimable@'claude-1'; B renamed back to 'claude'
-        self.reg.register("claude")                  # B -> 'claude-1', C = 'claude-2'; stale A lingers
+        self.reg.deregister("claude-1", reclaimable=True)              # A reclaimable@'claude-1'
+        self.reg.rename("claude-2", "claude-1")      # human rename: B onto A's name and slot
         reg2 = RuntimeRegistry(data_dir=self.tmp)    # server restart
         reg2.seed({
             "claude": {"label": "Claude", "color": "#ff6a00"},
@@ -187,7 +190,8 @@ class SessionReclaimTests(unittest.TestCase):
         """
         a = self.reg.register("claude")              # A = 'claude'
         tok_a = a["token"]
-        b = self.reg.register("claude")              # A -> 'claude-1', B = 'claude-2'
+        self.reg.rename("claude", "claude-1")        # human rename: A = 'claude-1' (slot 1)
+        b = self.reg.register("claude")              # B = 'claude-2'
         tok_b = b["token"]
         self.reg.register("claude")                  # C = 'claude-3'
         self.reg.deregister("claude-1", reclaimable=True)              # A reclaimable@'claude-1' (base=claude, slot=1)
@@ -212,7 +216,8 @@ class SessionReclaimTests(unittest.TestCase):
         """
         a = self.reg.register("claude")              # A = 'claude'
         tok_a = a["token"]
-        b = self.reg.register("claude")              # A -> 'claude-1', B = 'claude-2'
+        self.reg.rename("claude", "claude-1")        # human rename: A = 'claude-1' (slot 1)
+        b = self.reg.register("claude")              # B = 'claude-2'
         tok_b = b["token"]
         self.reg.register("claude")                  # C = 'claude-3'
         self.reg.deregister("claude-1", reclaimable=True)              # A reclaimable@'claude-1' (base=claude, slot=1)
