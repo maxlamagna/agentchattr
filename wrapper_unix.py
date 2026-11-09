@@ -26,6 +26,21 @@ from wake_gate import HELD, classify, enter_hold_reason, plain_text
 
 TMUX_COMMAND_TIMEOUT = 5.0
 IDLE_RECHECK_S = 0.15  # two captures this far apart must both read idle before any input
+# ad-ruq (Max #9848, #9957): after the paste, the CLI draws the text 7 to 298 ms later (measured on Claude Code
+# 2.1.319, 73 pastes, 2026-11-09-ad-ruq-recheck/evidence). While the prompt is positively empty and idle, look again
+# this often, until this long after the paste; then stop without Enter. An engineering bound, not a measured one.
+POST_PASTE_DEADLINE_S = 2.0
+POST_PASTE_RELOOK_S = 0.1
+
+
+class Uncertain(str):
+    """inject() result after a paste that was not followed by a confirmed Enter: a paste may have arrived
+    and the wake MUST NOT be retried (ad-519). The value is a fixed reason label for the delivery journal
+    (ad-ruq, Max #9848 criterion 3): never prompt text."""
+
+    @property
+    def reason(self) -> str:
+        return str(self)
 
 
 def _session_exists(session_name: str) -> bool:
@@ -138,13 +153,13 @@ def settled_hold_check(target: str, provider: str):
     return check
 
 
-def inject(text: str, *, tmux_session: str, delay: float = 0.3, provider: str = "") -> bool | None | str:
+def inject(text: str, *, tmux_session: str, delay: float = 0.3, provider: str = "") -> bool | Uncertain | str:
     """Deliver text to the agent CLI as ONE bracketed paste, then press Enter.
 
     Fail closed (ad-519): unless two captures show the provider's known empty prompt and the same
     text, this returns HELD having sent nothing, not even a mode change. After the paste it looks again, and without
-    the pasted text in the prompt it does not press Enter and returns None. True means tmux took the
-    keystrokes; it does not mean the agent read them.
+    the pasted text in the prompt it does not press Enter and returns Uncertain(reason) (ad-ruq: the reason
+    label goes to the delivery journal). True means tmux took the keystrokes; it does not mean the agent read them.
 
     Why a paste and not send-keys: a pty's raw input queue is finite (1024
     bytes on macOS), so a single long `send-keys -l` can reach the CLI as
@@ -159,8 +174,8 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3, provider: str = 
     Returns True only when tmux accepted both the paste and Enter. On any
     failure, a non-zero exit, timeout or an exception launching tmux, it prints a
     diagnostic, cleans up its buffer on a best-effort basis, sends nothing
-    further. False proves that the paste process never started; None means
-    a paste may have arrived and MUST NOT be retried. Each delivery and cleanup command has a
+    further. False proves that the paste process never started; an Uncertain (a str naming the
+    reason) means a paste may have arrived and MUST NOT be retried. Each delivery and cleanup command has a
     time limit so a stuck tmux cannot block the queue watcher indefinitely.
     Failure does not imply that retrying is safe: a paste may have arrived.
     """
@@ -174,11 +189,11 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3, provider: str = 
             _drop_buffer(buffer_name)
         except Exception:
             pass
-        return None if paste_attempted[0] else False
+        return Uncertain(f"exception:{type(exc).__name__}") if paste_attempted[0] else False
 
 
 def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float,
-             paste_attempted: list[bool], provider: str) -> bool | None | str:
+             paste_attempted: list[bool], provider: str) -> bool | Uncertain | str:
     """The paste-then-Enter sequence; every tmux exit status is checked."""
     pane = _pane_id(tmux_session)
     if pane is None:
@@ -223,24 +238,51 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float,
     except OSError:  # failed to start tmux; a timeout remains potentially pasted
         paste_attempted[0] = False
         raise
+    pasted_at = time.monotonic()  # the re-look budget below counts from here, as the measurement did
     if pasted.returncode != 0:
         print(f"  INJECT FAILED: paste-buffer exit {pasted.returncode}: "
               f"{pasted.stderr.decode(errors='replace').strip()}")
         _drop_buffer(buffer_name)
-        return None
+        return Uncertain("paste-command-failed")
 
     # Scale delay with text length so longer prompts get more processing time
-    time.sleep(max(delay, len(text) * 0.001))
+    first_wait = max(delay, len(text) * 0.001)
+    # ad-ruq: the budget for accepting the paste, counted from paste-buffer's return: max(2.0 s, first_wait + 0.1 s)
+    # (Max #10003). It exceeds 2.0 s only when first_wait exceeds 1.9 s, that is from 1901 characters at the default
+    # 0.3 s delay (2000 characters: 2.1 s; 3000: 3.1 s) or a configured inject_delay above 1.9 s, so such a prompt
+    # keeps today's first look. No capture that completes after the budget is accepted, the first one included (G3 F2).
+    budget = max(POST_PASTE_DEADLINE_S, first_wait + POST_PASTE_RELOOK_S)
+    time.sleep(first_wait)
     # A scroll during that pause would put the pane back in copy mode and eat the Enter.
     if not _leave_mode(pane):
         print(f"  INJECT FAILED: pane {pane} is in a tmux mode it did not leave (or the mode is "
               f"unreadable) after the paste; Enter not sent")
-        return None
-    screen = _capture_styled(pane)
-    reason = "unreadable" if screen is None else enter_hold_reason(provider, screen, text)
+        return Uncertain("tmux-mode")
+    reason, screen = _post_paste_reason(pane, provider, text)
+    if time.monotonic() - pasted_at > budget:  # the first look's own blocking steps can be slow too
+        reason = reason or "recheck-deadline"
+    # ad-ruq: the text may not be drawn yet. Look again, bounded, but ONLY while this same screen positively shows
+    # the provider's empty idle prompt (the unchanged ad-519 predicate): a draft, a dialog, a working pane, no prompt
+    # or an unreadable screen all stop at once (G2 F1). A capture that completes after the budget is never accepted,
+    # even when it shows the text (G2 F2). Nothing is ever pasted twice.
+    while reason == "paste-not-in-prompt" and _empty_idle(provider, screen):
+        remaining = budget - (time.monotonic() - pasted_at)
+        if remaining <= 0:
+            break
+        time.sleep(min(POST_PASTE_RELOOK_S, remaining))
+        if not _leave_mode(pane):
+            print(f"  INJECT FAILED: pane {pane} is in a tmux mode it did not leave (or the mode is "
+                  f"unreadable) during the post-paste re-look; Enter not sent")
+            return Uncertain("tmux-mode")
+        reason, screen = _post_paste_reason(pane, provider, text)
+        if time.monotonic() - pasted_at > budget:
+            reason = reason or "recheck-deadline"
+            break
+    if reason == "paste-not-in-prompt" and not _empty_idle(provider, screen):
+        reason = "paste-not-in-prompt+" + classify(provider, screen)[1]  # the honest label: not an empty prompt
     if reason:
         print(f"  INJECT STOPPED ({reason}): pasted but the prompt does not show it; Enter not sent")
-        return None
+        return Uncertain(reason)
     entered = subprocess.run(
         ["tmux", "send-keys", "-t", pane, "Enter"],
         capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
@@ -248,8 +290,20 @@ def _deliver(text: str, tmux_session: str, buffer_name: str, delay: float,
     if entered.returncode != 0:
         print(f"  INJECT FAILED: Enter exit {entered.returncode}: "
               f"{entered.stderr.decode(errors='replace').strip()}")
-        return None
+        return Uncertain("enter-failed")
     return True
+
+
+def _post_paste_reason(pane: str, provider: str, text: str) -> tuple[str, str | None]:
+    """('' only when the prompt visibly holds the pasted text (the unchanged ad-519 predicate), else why not; the screen)."""
+    screen = _capture_styled(pane)
+    reason = "unreadable" if screen is None else enter_hold_reason(provider, screen, text)
+    return reason, screen
+
+
+def _empty_idle(provider: str, screen: str | None) -> bool:
+    """The screen positively shows the provider's EMPTY idle prompt: the one state in which a paste may still be drawn."""
+    return screen is not None and classify(provider, screen) == ("idle", "")
 
 
 def _without_codex_input_animation(output: bytes) -> bytes:

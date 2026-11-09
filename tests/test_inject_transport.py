@@ -236,7 +236,8 @@ class InjectFailurePathTests(unittest.TestCase):
              mock.patch("sys.stdout") as out:
             ok = wrapper_unix.inject("x" * 10, tmux_session="s", delay=0.1)
 
-        self.assertIsNone(ok, 'paste-buffer ran: a failed exit does not prove retrying is safe')
+        self.assertIsInstance(ok, wrapper_unix.Uncertain, 'paste-buffer ran: a failed exit does not prove retrying is safe')
+        self.assertEqual(ok.reason, 'paste-command-failed', 'the journal gets the reason (ad-ruq)')
         self.assertFalse(any("Enter" in argv for argv in calls),
                          f"Enter must not be sent after a failed paste: {calls}")
         self.assertTrue(any(argv[1] == "delete-buffer" for argv in calls),

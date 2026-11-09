@@ -81,7 +81,7 @@ def begin_batch(path, lines, attempts):
         os.replace(tmp, journal)
 
 
-def _finish_locked(path, queue, lines, status, attempts, consume=True):
+def _finish_locked(path, queue, lines, status, attempts, consume=True, reason=None):
     prefix = ''.join(lines)
     queue.seek(0)
     current = queue.read()
@@ -90,6 +90,8 @@ def _finish_locked(path, queue, lines, status, attempts, consume=True):
               'lines':len(lines), 'sha256':_digest(lines)}
     if not matches:
         record['delivery_outcome'] = status
+    if reason:
+        record['reason'] = reason
     with open(path.with_suffix('.delivery.jsonl'), 'a', encoding='utf-8') as trace:
         trace.write(json.dumps(record) + '\n')
         trace.flush()
@@ -131,13 +133,14 @@ def retain_stale(path, lines):
             os.fsync(trace.fileno())
 
 
-def finish_batch(path, lines, status, attempts, *, consume=True):
+def finish_batch(path, lines, status, attempts, *, consume=True, reason=None):
     """Keep concurrent appends; retain uncertain/exhausted deliveries for manual recovery.
 
-    The trace contains hashes/counts rather than prompt text. Only a proven pre-paste
+    The trace contains hashes/counts rather than prompt text, plus `reason`, a fixed label naming
+    why a delivery ended uncertain (ad-ruq), when the injector gave one. Only a proven pre-paste
     refusal is retryable. An ambiguous result is preserved, never automatically resent.
     False means another consumer changed the prefix; the caller must read a fresh batch.
     """
     with queue_lock(path):
         with open(path, 'r+', encoding='utf-8') as queue:
-            return _finish_locked(path, queue, lines, status, attempts, consume)
+            return _finish_locked(path, queue, lines, status, attempts, consume, reason)

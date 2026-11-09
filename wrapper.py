@@ -568,6 +568,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
     pending_file = None
     attempts = 0
     disposition = ''
+    reason = None  # of an uncertain disposition, for the journal (ad-ruq); a fixed label, never prompt text
     pending_prompt = ''
     prompt_key = None
     while True:
@@ -582,6 +583,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 pending = read_batch(pending_file)
                 attempts = 0
                 disposition = ''
+                reason = None
                 pending_prompt = ''
                 prompt_key = None
                 if not pending:
@@ -589,7 +591,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
             if pending:
                 # A failed acknowledgement after a paste must never paste again.
                 if disposition:
-                    finish_batch(pending_file, pending, disposition, attempts)
+                    finish_batch(pending_file, pending, disposition, attempts, reason=reason)
                     pending = []
                     continue
 
@@ -710,10 +712,12 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         pending_prompt = prompt.replace("\n", " ")
                         prompt_key = key
                     begin_batch(pending_file, pending, attempts)
+                    raised = False
                     try:
                         result = inject_fn(pending_prompt)
                     except Exception:
                         result = None  # an exception does not prove nothing was pasted
+                        raised = True
                     if result is HELD:
                         # The screen changed after the hold check: nothing typed, so nothing was used up.
                         finish_batch(pending_file, pending, 'held', attempts, consume=False)
@@ -729,8 +733,11 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         # tmux taking the keys is not the agent reading them: never call this delivered.
                         disposition = ('transport-accepted' if result is True else
                                        'not-pasted-exhausted' if result is False else 'uncertain')
+                        # ad-ruq: the injector's reason for an uncertain delivery, a fixed label (wrapper_unix.Uncertain);
+                        # an injector that raised or an older injector (Windows) gives none or 'inject-raised'.
+                        reason = getattr(result, 'reason', None) if result is not None else 'inject-raised' if raised else None
                         hold.release(pending_file)  # only now: a later HELD must keep the hold's age
-                        finish_batch(pending_file, pending, disposition, attempts)
+                        finish_batch(pending_file, pending, disposition, attempts, reason=reason)
                         pending = []
                 else:
                     disposition = 'ignored'

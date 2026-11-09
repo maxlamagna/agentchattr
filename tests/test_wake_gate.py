@@ -343,9 +343,12 @@ class InjectGateTests(unittest.TestCase):
                                        ("agy", screen("agy-idle-after-turn"), "agy-dialog")):
             with self.subTest(provider=provider):
                 self.fake.set_screens(before, screen(name))
-                self.assertIsNone(self.inject(provider))
+                result = self.inject(provider)
+                self.assertIsInstance(result, wrapper_unix.Uncertain, "a stopped Enter carries its reason (ad-ruq)")
+                self.assertIn(result.reason, ("dialog", "working-or-dialog"))
                 self.assertEqual(self.fake.verbs().count("paste-buffer"), 1)
                 self.assertNotIn("send-keys", self.fake.verbs())
+                self.assertEqual(self.fake.verbs().count("capture-pane"), 3, "a dialog is never re-looked at")
 
     def test_a_screen_that_turns_after_the_first_look_gets_zero_input(self):
         """Two looks: the second finds the dialog, so nothing is typed."""
@@ -384,6 +387,294 @@ class InjectGateTests(unittest.TestCase):
         with mock.patch.object(wrapper_unix, "_capture_styled", side_effect=lambda target: next(looks)), \
              mock.patch.dict(os.environ, self.fake.env()), mock.patch("sys.stdout"):
             self.assertIs(wrapper_unix.inject(WAKE, tmux_session="s", delay=0, provider="codex"), True)
+
+
+class FakeClock:
+    """wrapper_unix's view of `time`: sleep advances it, monotonic reads it. Nothing else in the process is touched."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class PostPasteRecheckTests(unittest.TestCase):
+    """ad-ruq (Max #9848): after the paste, a bounded re-look while the text is not drawn yet; no Enter otherwise.
+
+    Measured on a real Claude Code 2.1.319 (2026-11-09-ad-ruq-recheck/evidence): the paste is drawn 7 to 298 ms after
+    `paste-buffer` returns, and the only interim state is `paste-not-in-prompt`.
+    """
+
+    IDLE = {"claude": "claude-idle-start", "codex": "codex-idle-start", "agy": "agy-idle-after-turn"}
+    DRAWN = {"claude": lambda: claude_prompt(WAKE), "codex": lambda: codex_prompt(WAKE), "agy": lambda: agy_prompt(WAKE)}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fake = FakeTmux(tmp.name)
+        self.fake.set_screens(screen("claude-idle-start"))
+        self.clock = FakeClock()
+
+    def inject(self, looks, provider="claude", leave_mode=None, text=WAKE):
+        """looks: the screens successive captures return (the last repeats); None = the capture fails.
+
+        A fresh fake clock per call (subtests share the fixture). `self.since_paste` is the simulated time from the
+        paste to the return, the budget's own reference: the first post-paste look comes after the unchanged
+        first-look sleep (0.3 s for an 80-character wake)."""
+        looks = list(looks)
+        captures = []
+        self.clock = FakeClock() if not getattr(self, "keep_clock", False) else self.clock
+        pasted_at = []
+
+        first_wait = max(0.3, len(text) * 0.001)
+
+        def capture(target):
+            if (self.fake.root / "pasted").exists() and not pasted_at:
+                # the first post-paste capture comes after the first-look wait (plus any simulated slow step)
+                pasted_at.append(self.clock.now - first_wait - getattr(self.clock, "first_overshoot", 0.0))
+            captures.append(target)
+            return looks.pop(0) if len(looks) > 1 else looks[0]
+        patches = [mock.patch.object(wrapper_unix, "_capture_styled", side_effect=capture),
+                   mock.patch.object(wrapper_unix, "time", self.clock),
+                   mock.patch.dict(os.environ, self.fake.env()), mock.patch("sys.stdout")]
+        if leave_mode is not None:
+            patches.append(mock.patch.object(wrapper_unix, "_leave_mode", side_effect=leave_mode))
+        with patches[0], patches[1], patches[2], patches[3]:
+            if leave_mode is None:
+                result = wrapper_unix.inject(text, tmux_session="s", delay=0.3, provider=provider)
+            else:
+                with patches[4]:
+                    result = wrapper_unix.inject(text, tmux_session="s", delay=0.3, provider=provider)
+        self.since_paste = self.clock.now - pasted_at[0] if pasted_at else None
+        return result, len(captures) - 2  # the two pre-paste looks are not post-paste looks
+
+    def pre(self, provider="claude"):
+        return [screen(self.IDLE[provider]), screen(self.IDLE[provider])]
+
+    def assert_one_enter(self):
+        self.assertEqual(self.fake.verbs().count("paste-buffer"), 1)
+        self.assertEqual(self.fake.verbs().count("send-keys"), 1)
+
+    def assert_no_enter(self):
+        self.assertEqual(self.fake.verbs().count("paste-buffer"), 1, "the paste is never repeated")
+        self.assertNotIn("send-keys", self.fake.verbs())
+
+    def test_the_constants_are_the_measured_bound(self):
+        self.assertEqual(wrapper_unix.POST_PASTE_DEADLINE_S, 2.0)
+        self.assertEqual(wrapper_unix.POST_PASTE_RELOOK_S, 0.1)
+
+    def test_text_drawn_at_the_first_look_gives_one_enter_as_before(self):
+        for provider in ("claude", "codex", "agy"):
+            with self.subTest(provider=provider):
+                self.fake.set_screens(screen(self.IDLE[provider]))
+                result, looks = self.inject(self.pre(provider) + [self.DRAWN[provider]()], provider)
+                self.assertIs(result, True)
+                self.assertEqual(looks, 1)
+                self.assert_one_enter()
+
+    def test_text_drawn_late_gives_exactly_one_enter(self):
+        for provider in ("claude", "codex", "agy"):
+            for late_looks in (1, 16):  # the second look (~0.4 s) and the last one before the deadline
+                with self.subTest(provider=provider, late_looks=late_looks):
+                    self.fake.set_screens(screen(self.IDLE[provider]))
+                    idle = screen(self.IDLE[provider])
+                    result, looks = self.inject(self.pre(provider) + [idle] * late_looks + [self.DRAWN[provider]()], provider)
+                    self.assertIs(result, True)
+                    self.assertEqual(looks, late_looks + 1)
+                    self.assert_one_enter()
+                    self.assertLess(self.since_paste, wrapper_unix.POST_PASTE_DEADLINE_S)
+
+    def test_text_never_drawn_gives_no_enter_within_the_bound_and_the_reason(self):
+        result, looks = self.inject(self.pre() + [screen("claude-idle-start")])
+        self.assertIsInstance(result, wrapper_unix.Uncertain)
+        self.assertEqual(result.reason, "paste-not-in-prompt")
+        self.assert_no_enter()
+        bound = int(wrapper_unix.POST_PASTE_DEADLINE_S / wrapper_unix.POST_PASTE_RELOOK_S) + 2
+        self.assertLessEqual(looks, bound)
+        self.assertGreater(looks, 3, "a re-look happened")
+        self.assertAlmostEqual(self.since_paste, wrapper_unix.POST_PASTE_DEADLINE_S, places=6,
+                               msg="the wait ends exactly at the deadline, and Enter is never pressed at it")
+
+    def test_the_original_approval_dialog_is_one_look_and_no_enter(self):
+        result, looks = self.inject(self.pre() + [screen("claude-dialog")])
+        self.assertIsInstance(result, wrapper_unix.Uncertain)
+        self.assertIn(result.reason, ("dialog", "working-or-dialog"))
+        self.assertEqual(looks, 1)
+        self.assert_no_enter()
+
+    def test_a_dialog_a_turn_or_an_unreadable_screen_during_the_window_stops_at_that_look(self):
+        for name, reasons in (("claude-dialog", ("dialog", "working-or-dialog")),
+                              ("claude-working", ("working-or-dialog",)),
+                              (None, ("unreadable",))):
+            with self.subTest(interrupt=name):
+                self.fake.set_screens(screen("claude-idle-start"))
+                idle = screen("claude-idle-start")
+                interrupt = None if name is None else screen(name)
+                result, looks = self.inject(self.pre() + [idle, idle, interrupt, claude_prompt(WAKE)])
+                self.assertIsInstance(result, wrapper_unix.Uncertain)
+                self.assertIn(result.reason, reasons)
+                self.assertEqual(looks, 3, "stop at the look that saw it; the later drawn screen is never reached")
+                self.assert_no_enter()
+
+    def test_a_tmux_mode_the_helper_cannot_leave_during_the_window_stops_without_enter(self):
+        idle = screen("claude-idle-start")
+        result, looks = self.inject(self.pre() + [idle, idle, claude_prompt(WAKE)], leave_mode=[True, True, False])
+        self.assertIsInstance(result, wrapper_unix.Uncertain)
+        self.assertEqual(result.reason, "tmux-mode")
+        self.assert_no_enter()
+
+    def test_a_tmux_mode_the_helper_leaves_is_no_stop(self):
+        """_leave_mode clears a mode and returns True (G2 F2 note): the look then proceeds as today."""
+        idle = screen("claude-idle-start")
+        result, looks = self.inject(self.pre() + [idle, idle, claude_prompt(WAKE)], leave_mode=[True, True, True, True])
+        self.assertIs(result, True)
+        self.assert_one_enter()
+
+    def test_an_unexpected_draft_is_never_waited_on_and_never_entered(self):
+        """G2 F1: `paste-not-in-prompt` also names a composer holding someone's draft (the claude-typed fixture reads
+        hold/typed and paste-not-in-prompt at once). No wait on it, and a later frame that would pass the Enter
+        predicate (wake prefix plus the draft) is never reached."""
+        idle = screen("claude-idle-start")
+        passes_later = claude_prompt(WAKE + " DRAFT")
+        self.assertEqual(wake_gate.enter_hold_reason("claude", passes_later, WAKE), "", "the later frame would pass")
+        for name, draft, at in (("first look, real typed fixture", screen("claude-typed"), 1),
+                                ("first look, synthetic draft", claude_prompt("DRAFT"), 1),
+                                ("later look, synthetic draft", claude_prompt("DRAFT"), 3)):
+            with self.subTest(case=name):
+                self.fake.set_screens(idle)
+                result, looks = self.inject(self.pre() + [idle] * (at - 1) + [draft, passes_later])
+                self.assertIsInstance(result, wrapper_unix.Uncertain)
+                self.assertEqual(result.reason, "paste-not-in-prompt+typed")
+                self.assertEqual(looks, at, "no look after the unexpected draft was seen")
+                self.assert_no_enter()
+
+    def test_a_capture_completing_after_the_deadline_is_never_accepted(self):
+        """G2 F2: the sleep oversleeps (a slow capture or scheduler), so the last capture completes past the
+        deadline although it was started inside it; it shows the text and still gets no Enter."""
+        idle = screen("claude-idle-start")
+        self.clock = FakeClock()
+        self.keep_clock = True
+        real_sleep = self.clock.sleep
+
+        def oversleep(seconds):
+            real_sleep(seconds)
+            if self.clock.now - 1000.0 > 2.1:  # 0.15 pre-paste + 1.95 after it: from here each step runs 0.2 s long
+                self.clock.now += 0.2
+        self.clock.sleep = oversleep
+        # 17 idle frames fill the looks up to 1.9 s; the 18th capture, started inside the budget, completes at
+        # about 2.2 s because of the oversleep and shows the text: it must not be accepted
+        result, looks = self.inject(self.pre() + [idle] * 17 + [claude_prompt(WAKE)])
+        self.assertIsInstance(result, wrapper_unix.Uncertain)
+        self.assertEqual(result.reason, "recheck-deadline")
+        self.assertEqual(looks, 18)
+        self.assert_no_enter()
+        self.assertLessEqual(self.since_paste, wrapper_unix.POST_PASTE_DEADLINE_S + 0.3)
+
+    def test_a_slow_first_look_completing_after_the_deadline_is_never_accepted(self):
+        """G3 F2: the FIRST look's own blocking steps can be slow (a 1.9 s capture at the ordinary 0.3 s wait). A
+        first capture that completes after the budget and shows the text gets no Enter either."""
+        self.clock = FakeClock()
+        self.keep_clock = True
+        real_sleep = self.clock.sleep
+
+        def slow_first_look(seconds):
+            real_sleep(seconds)
+            if seconds == 0.3:  # the first-look wait: the capture that follows takes 1.9 s
+                self.clock.now += 1.9
+                self.clock.first_overshoot = 1.9
+        self.clock.sleep = slow_first_look
+        result, looks = self.inject(self.pre() + [claude_prompt(WAKE)])
+        self.assertIsInstance(result, wrapper_unix.Uncertain)
+        self.assertEqual(result.reason, "recheck-deadline")
+        self.assertEqual(looks, 1, "no re-look after the budget")
+        self.assert_no_enter()
+
+    def test_a_slow_first_mode_check_or_first_capture_is_never_accepted_after_the_budget(self):
+        """G3 P2, both first-look blocking steps named by Codex (#9988): the slowness sits in the mode check itself or
+        in the capture itself, the screen shows the text, and no Enter follows. Positive control: the same frames with
+        fast steps give one Enter."""
+        idle = screen("claude-idle-start")
+        for slow_step in ("mode", "capture", None):
+            with self.subTest(slow_step=slow_step):
+                self.fake.set_screens(idle)
+                self.clock = FakeClock()
+                self.keep_clock = True
+                self.clock.first_overshoot = 0.0
+                calls = {"mode": 0, "capture": 0}
+                real_leave = wrapper_unix._leave_mode
+
+                def leave(pane):
+                    calls["mode"] += 1
+                    if slow_step == "mode" and calls["mode"] == 2:  # the first POST-paste mode check
+                        self.clock.now += 1.9
+                        self.clock.first_overshoot = 1.9
+                    return True
+                looks_seq = self.pre() + [claude_prompt(WAKE)]
+
+                def slow_capture(target):
+                    calls["capture"] += 1
+                    if slow_step == "capture" and calls["capture"] == 3:  # the first post-paste capture
+                        self.clock.now += 1.9
+                        self.clock.first_overshoot = 1.9
+                    return looks_seq.pop(0) if len(looks_seq) > 1 else looks_seq[0]
+                with mock.patch.object(wrapper_unix, "_leave_mode", side_effect=leave), \
+                     mock.patch.object(wrapper_unix, "_capture_styled", side_effect=slow_capture), \
+                     mock.patch.object(wrapper_unix, "time", self.clock), \
+                     mock.patch.dict(os.environ, self.fake.env()), mock.patch("sys.stdout"):
+                    result = wrapper_unix.inject(WAKE, tmux_session="s", delay=0.3, provider="claude")
+                if slow_step is None:
+                    self.assertIs(result, True)
+                    self.assert_one_enter()
+                else:
+                    self.assertIsInstance(result, wrapper_unix.Uncertain)
+                    self.assertEqual(result.reason, "recheck-deadline")
+                    self.assertEqual(calls["capture"], 3, "no re-look after the budget")
+                    self.assert_no_enter()
+                del real_leave
+
+    def test_a_long_prompt_keeps_its_first_look_and_its_bound_follows_it(self):
+        """A 3000-character prompt waits 3.0 s before its first look today; the budget is then that wait plus one
+        re-look, never less than the first look, so long wakes keep today's behaviour and stay bounded."""
+        long = "x" * 3000
+        drawn = claude_prompt(long[:60])
+        self.assertEqual(wake_gate.enter_hold_reason("claude", drawn, long), "")
+        result, looks = self.inject(self.pre() + [drawn], text=long)
+        self.assertIs(result, True)
+        self.assertEqual(looks, 1)
+        self.assert_one_enter()
+        self.fake.set_screens(screen("claude-idle-start"))
+        result, looks = self.inject(self.pre() + [screen("claude-idle-start")], text=long)
+        self.assertIsInstance(result, wrapper_unix.Uncertain)
+        self.assertEqual(result.reason, "paste-not-in-prompt")
+        self.assertEqual(looks, 2, "the first look at 3.0 s and one re-look at 3.1 s")
+        self.assertAlmostEqual(self.since_paste, 3.0 + wrapper_unix.POST_PASTE_RELOOK_S, places=6)
+        self.assert_no_enter()
+
+    def test_text_drawn_in_a_late_capture_inside_the_deadline_is_entered_once(self):
+        """The complement of the previous test: the same frames with an exact clock are accepted at the last look."""
+        idle = screen("claude-idle-start")
+        result, looks = self.inject(self.pre() + [idle] * 17 + [claude_prompt(WAKE)])
+        self.assertIs(result, True)
+        self.assertEqual(looks, 18)
+        self.assert_one_enter()
+        self.assertAlmostEqual(self.since_paste, wrapper_unix.POST_PASTE_DEADLINE_S, places=6)
+
+    def test_uncertain_is_a_plain_string_for_the_watcher_and_carries_its_reason(self):
+        result = wrapper_unix.Uncertain("paste-not-in-prompt")
+        self.assertIsInstance(result, str)
+        self.assertEqual(result.reason, "paste-not-in-prompt")
+        self.assertIsNot(result, True)
+        self.assertIsNot(result, False)
+        self.assertIsNot(result, wake_gate.HELD)
 
 
 class SettledCheckTests(unittest.TestCase):
@@ -595,13 +886,53 @@ class WatcherHoldTests(unittest.TestCase):
         self.assertTrue(self.queue.read_text())
 
     def test_an_ambiguous_write_is_still_never_replayed(self):
-        for outcome in (None,):
-            self.put()
-            calls = self.watch([""], outcomes=(outcome,), polls=5)
-            self.assertEqual(len(calls), 1)
-            self.assertIn("uncertain", self.trace())
-            self.assertEqual(self.queue.read_text(), "")
-            self.assertIn("COMPLETION-A", self.side(".failed.jsonl").read_text())
+        for outcome in (None, wrapper_unix.Uncertain("paste-not-in-prompt")):
+            with self.subTest(outcome=outcome):
+                self.put()
+                calls = self.watch([""], outcomes=(outcome,), polls=5)
+                self.assertEqual(len(calls), 1)
+                self.assertIn("uncertain", self.trace())
+                self.assertEqual(self.queue.read_text(), "")
+                self.assertIn("COMPLETION-A", self.side(".failed.jsonl").read_text())
+                self.side(".failed.jsonl").unlink()
+                self.side(".delivery.jsonl").unlink()
+
+    def test_the_journal_row_of_an_uncertain_delivery_names_its_reason_and_no_prompt_text(self):
+        """ad-ruq criterion 3: today the reason is printed on the wrapper's terminal only (2026-11-08 record, D4)."""
+        def raising(prompt):
+            raise RuntimeError("boom")
+        cases = ((wrapper_unix.Uncertain("paste-not-in-prompt"), "paste-not-in-prompt"),
+                 (wrapper_unix.Uncertain("working-or-dialog"), "working-or-dialog"),
+                 (raising, "inject-raised"),
+                 (None, None))
+        for outcome, reason in cases:
+            with self.subTest(reason=reason):
+                for suffix in (".failed.jsonl", ".delivery.jsonl"):
+                    self.side(suffix).unlink(missing_ok=True)
+                self.put("COMPLETION-SECRET")
+                if callable(outcome):
+                    outcome.hold_check = lambda: ""
+                    ticks = [0]
+
+                    def sleep(seconds):
+                        if seconds == 1:
+                            ticks[0] += 1
+                            if ticks[0] >= 4:
+                                raise StopWatcher()
+                    with mock.patch.object(wrapper.time, "sleep", sleep), \
+                         mock.patch.object(wrapper, "_fetch_role", return_value=""), \
+                         mock.patch.object(wrapper, "_fetch_active_rules", return_value=None):
+                        with self.assertRaises(StopWatcher):
+                            wrapper._queue_watcher(lambda: ("tester", self.queue), outcome)
+                else:
+                    self.watch([""], outcomes=(outcome,), polls=5)
+                rows = [json.loads(line) for line in self.trace().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["outcome"], "uncertain")
+                self.assertEqual(rows[0].get("reason"), reason)
+                self.assertNotIn("COMPLETION-SECRET", self.trace(), "the journal never holds prompt text")
+                self.assertIn("COMPLETION-SECRET", self.side(".failed.jsonl").read_text())
+                self.assertFalse(self.side(".hold.json").exists())
 
     def test_a_held_pane_does_not_turn_an_interrupted_old_attempt_into_a_hold(self):
         """A journal left by a dead wrapper means a paste may have arrived: quarantined, not replayed."""
