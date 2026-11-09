@@ -175,7 +175,7 @@ class RuntimeRegistry:
             return
         inst = self._reclaimable[cand]
         # Fresh-wins: never revive an identity whose (base, slot) is already live
-        # (e.g. its slot was reclaimed by a fresh launch or a rename-back).
+        # (e.g. its slot was reclaimed by a fresh launch or a human rename).
         if any(li.base == inst.base and li.slot == inst.slot for li in self._instances.values()):
             return
         self._reclaimable.pop(cand, None)
@@ -190,9 +190,9 @@ class RuntimeRegistry:
         did, `_save_instances` would write both records and `_load_instances` could let
         the stale one overwrite the live one (same dict key) on restart — reviving a dead
         token and stranding the live one. Call this after any mutation that creates or
-        moves a live instance (register incl. slot-1 rename, deregister rename-back,
-        claim, rename), while holding self._lock. Keeps _instances and _reclaimable
-        disjoint so the persisted snapshot is always unambiguous.
+        moves a live instance (register, deregister, claim, rename), while holding
+        self._lock. Keeps _instances and _reclaimable disjoint so the persisted
+        snapshot is always unambiguous.
         """
         live_names = set(self._instances.keys())
         live_coords = {(i.base, i.slot) for i in self._instances.values()}
@@ -755,7 +755,7 @@ class RuntimeRegistry:
                     continue
                 # Fresh-wins guard: if a live instance already holds this (base, slot),
                 # the token is stale (its identity was superseded by a fresh launch or a
-                # rename-back). Drop it rather than reviving a colliding second instance.
+                # human rename). Drop it rather than reviving a colliding second instance.
                 if any(li.base == inst.base and li.slot == inst.slot
                        for li in self._instances.values()):
                     del self._reclaimable[name]

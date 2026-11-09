@@ -534,8 +534,7 @@ def _migrate_agent_last_channel(old_name: str, new_name: str):
     Without this, a disconnect for the post-rename name misses the map and
     falls back to the global last-active channel — putting the leave message
     back in the wrong channel. Call this beside every migrate_identity /
-    rename_sender path (slot-1 rename, renamed-back, websocket rename_agent,
-    /api/label)."""
+    rename_sender path (the human renames: websocket rename_agent, /api/label)."""
     if old_name == new_name:
         return
     ch = _agent_last_channel.pop(old_name, None)
