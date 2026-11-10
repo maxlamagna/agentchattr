@@ -511,9 +511,34 @@ class AliasAndCoordinateTests(_Room):
         self.assertEqual(self.registry.get_all_names(), [])
 
     def test_malformed_name_is_refused(self):
-        with self.assertRaises(registry_mod.NameUnavailable) as caught:
-            self.registry.register("claude", name="Claude Music!")
-        self.assertEqual(caught.exception.code, "invalid_name")
+        for bad in ("Claude Music!", "-claude", "claude-", "claude music", "claude_music",
+                    "claude/../x", "", 7):
+            with self.subTest(name=bad):
+                with self.assertRaises(registry_mod.NameUnavailable) as caught:
+                    self.registry.register("claude", name=bad)
+                self.assertEqual(caught.exception.code, "invalid_name")
+        self.assertEqual(self.registry.get_all_names(), [])
+
+    def test_a_long_human_alias_can_return(self):
+        """Codex review F4: the rename path has no length bound, so neither may a return."""
+        long_alias = "claude-" + "x" * 58  # 65 characters
+        self.registry.register("claude")
+        self.assertIsInstance(self.registry.rename("claude", long_alias), dict)
+        self.registry.deregister(long_alias)
+        back = self.registry.register("claude", name=long_alias)
+        self.assertEqual(back["name"], long_alias)
+
+    def test_names_the_label_sanitiser_produces_are_accepted(self):
+        """Every name the human rename endpoint can produce is one a returning wrapper may ask for."""
+        for label in ("Claude Music", "Claude 2nd Run", "-Claude Edge-", "Claude " + "Long " * 30):
+            with self.subTest(label=label):
+                reg = self.registry.register("claude")
+                resp = asyncio.run(app.rename_agent_label(reg["name"], FakeRequest(body={"label": label})))
+                alias = json.loads(resp.body)["new_name"]
+                self.registry.deregister(alias)
+                back = self.registry.register("claude", name=alias)
+                self.assertEqual(back["name"], alias)
+                self.registry.deregister(alias)
 
     def test_register_endpoint_answers_slot_in_use(self):
         self.registry.register("claude")

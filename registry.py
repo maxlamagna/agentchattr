@@ -22,7 +22,8 @@ from pathlib import Path
 IDENTITY_CONTRACT = 2
 
 # The shape a human rename produces (/api/label sanitises to it); a requested name must have it.
-_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
+# No length bound: the rename path has none, and a returning alias must not be stranded (review F4).
+_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
 
 class NameUnavailable(Exception):

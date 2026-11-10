@@ -261,6 +261,168 @@ class OwnershipFenceWatcherTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(self.queue.read_bytes(), before)
 
+    def run_watcher(self, owner, inject, polls=6):
+        ticks = 0
+
+        def sleep(seconds):
+            nonlocal ticks
+            if seconds == 1:
+                ticks += 1
+                if ticks >= polls:
+                    raise StopWatcher()
+
+        with mock.patch.object(wrapper.time, "sleep", sleep), \
+             mock.patch.object(wrapper, "_fetch_role", return_value=""), \
+             mock.patch.object(wrapper, "_fetch_active_rules", return_value=None):
+            with self.assertRaises(StopWatcher):
+                wrapper._queue_watcher(lambda: ("claude", self.queue), inject, owns_queue_fn=owner)
+
+    def test_a_retry_after_lost_ownership_leaves_the_batch_queued(self):
+        """Codex review F1: a proven-unpasted batch is retried only while the server still
+        confirms ownership; once it does not, the batch stays queued for the owner."""
+        self.put("for the owner")
+        before = self.queue.read_bytes()
+        answers = iter([True])  # the check before the read confirms; every later one refuses
+        checks, calls = [], []
+
+        def owner(name):
+            checks.append(name)
+            return next(answers, False)
+
+        def inject(prompt):
+            calls.append(prompt)
+            return False  # proven: nothing was pasted
+
+        self.run_watcher(owner, inject)
+        self.assertEqual(len(calls), 1, "no retry once ownership is not confirmed")
+        self.assertGreaterEqual(len(checks), 2, "the retry asked the server first")
+        self.assertEqual(self.queue.read_bytes(), before)
+        self.assertEqual([r["outcome"] for r in self.journal()], ["not-pasted"])
+        self.assertFalse(self.queue.with_suffix(".attempt.json").exists())
+
+    def test_a_retry_while_still_owner_goes_ahead(self):
+        """Positive control for F1: the owner's retry is delivered, after one more check."""
+        self.put("for the owner")
+        results = iter([False, True])
+        checks, calls = [], []
+
+        def owner(name):
+            checks.append(name)
+            return True
+
+        def inject(prompt):
+            calls.append(prompt)
+            return next(results)
+
+        self.run_watcher(owner, inject)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(checks, ["claude", "claude"], "one check at the read, one before the retry")
+        self.assertEqual([r["outcome"] for r in self.journal()], ["not-pasted", "transport-accepted"])
+        self.assertEqual(self.queue.read_text("utf-8"), "")
+
+
+# --- Group 15 / Codex review F2: start-up disposal behind the ownership fence ------------------
+
+class StartupDisposalTests(unittest.TestCase):
+    OWN = "1" * 32
+    LIVE_OWNER = "2" * 32  # the identity that holds the name now (B in the review's scenario)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.queue = self.root / "claude_queue.jsonl"
+        self.ordinary = json.dumps({"sender": "user", "text": "user: hi", "channel": "general"}) + "\n"
+        self.strict = json.dumps({"sender": "user", "text": "user: for b", "channel": "general",
+                                  "prompt": "p", "identity_id": self.LIVE_OWNER}) + "\n"
+        self.queue.write_text(self.ordinary + self.strict, "utf-8")
+        wrapper.begin_batch(self.queue, [self.ordinary], 1)  # a dead wrapper's mid-delivery record
+
+    def files(self):
+        return {p.name: p.read_bytes() for p in sorted(self.root.iterdir())}
+
+    def run_watcher(self, owner, disposer, inject=None, polls=6):
+        calls = []
+        ticks = 0
+
+        def sleep(seconds):
+            nonlocal ticks
+            if seconds == 1:
+                ticks += 1
+                if ticks >= polls:
+                    raise StopWatcher()
+
+        def record(prompt):
+            calls.append(prompt)
+            return True
+
+        with mock.patch.object(wrapper.time, "sleep", sleep), \
+             mock.patch.object(wrapper, "_fetch_role", return_value=""), \
+             mock.patch.object(wrapper, "_fetch_active_rules", return_value=None):
+            with self.assertRaises(StopWatcher):
+                wrapper._queue_watcher(lambda: ("claude", self.queue), inject or record,
+                                       owns_queue_fn=owner, startup_fn=disposer,
+                                       get_identity_id_fn=lambda: self.OWN)
+        return calls
+
+    def test_a_startup_that_does_not_own_the_queue_touches_nothing(self):
+        """Codex review F2: a stale start-up settles, copies, clears and retains nothing,
+        for the ordinary wake and the live owner's strict wake alike."""
+        before = self.files()
+        disposer = wrapper._startup_disposer(self.queue, lambda: self.OWN, False,
+                                             [self.ordinary, self.strict])
+        calls = self.run_watcher(lambda name: False, disposer)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.files(), before)
+
+    def test_the_owner_check_runs_before_any_settlement(self):
+        late = json.dumps({"sender": "user", "text": "user: after registration",
+                           "channel": "general"}) + "\n"
+        disposer = wrapper._startup_disposer(self.queue, lambda: self.OWN, False,
+                                             [self.ordinary, self.strict])
+        with open(self.queue, "a", encoding="utf-8") as f:
+            f.write(late)
+        events = []
+
+        def owner(name):
+            events.append(("check", self.queue.with_suffix(".attempt.json").exists()))
+            return True
+
+        def dispose(path):
+            events.append(("dispose", None))
+            return disposer(path)
+
+        def inject(prompt):
+            events.append(("inject", None))
+            return True
+
+        self.run_watcher(owner, dispose, inject=inject)
+        self.assertEqual(events[0], ("check", True), "the check came before any settlement")
+        self.assertEqual([e[0] for e in events], ["check", "dispose", "inject"])
+        self.assertEqual(self.queue.read_text("utf-8"), "")
+        # The dead wrapper's batch is preserved as uncertain (read_batch), never resent; the
+        # retired identity's strict wake is retained; only the post-registration wake is delivered.
+        self.assertEqual(self.queue.with_suffix(".failed.jsonl").read_text("utf-8"),
+                         self.ordinary + self.strict)
+        outcomes = [json.loads(l)["outcome"] for l in
+                    self.queue.with_suffix(".delivery.jsonl").read_text("utf-8").splitlines()]
+        self.assertEqual(outcomes, ["uncertain", "stale-identity", "transport-accepted"])
+
+    def test_startup_disposal_runs_once(self):
+        disposer = wrapper._startup_disposer(self.queue, lambda: self.OWN, False, [self.ordinary])
+        disposer(self.queue)
+        with open(self.queue, "a", encoding="utf-8") as f:
+            f.write(self.ordinary)
+        self.assertIsNone(disposer(self.queue))
+        self.assertTrue(self.queue.read_text("utf-8").endswith(self.ordinary))
+
+    def test_startup_disposal_never_touches_another_queue(self):
+        other = self.root / "claude-music_queue.jsonl"
+        other.write_text(self.ordinary, "utf-8")
+        disposer = wrapper._startup_disposer(self.queue, lambda: self.OWN, False, [self.ordinary])
+        self.assertIsNone(disposer(other))
+        self.assertEqual(other.read_text("utf-8"), self.ordinary)
+
 
 # --- Group 15: queue disposition at start -------------------------------------------------------
 
@@ -322,6 +484,62 @@ class QueueDispositionTests(unittest.TestCase):
         self.queue.unlink()
         wrapper._dispose_queue_at_start(self.queue, self.OWN, named=True)
         self.assertFalse(self.queue.exists())
+
+    def snapshot_lines(self):
+        return self.queue.read_text("utf-8").splitlines(keepends=True)
+
+    def test_a_wake_queued_between_registration_and_disposal_is_kept(self):
+        """Codex review F3: only lines present before registration are recycled-name backlog.
+        An ordinary mention routed to the new registration before disposal is its own wake."""
+        before_registration = self.snapshot_lines()
+        late = json.dumps({"sender": "user", "text": "user: after registration",
+                           "channel": "general"}) + "\n"
+        with open(self.queue, "a", encoding="utf-8") as f:
+            f.write(late)
+        counts = wrapper._dispose_queue_at_start(self.queue, self.OWN, named=False,
+                                                 pre_lines=before_registration)
+        self.assertEqual(self.queue.read_text("utf-8"), late)
+        self.assertEqual(self.queue.with_suffix(".failed.jsonl").read_text("utf-8"), self.retired_line)
+        self.assertIn(late, self.evidence_text())
+        self.assertEqual(counts["cleared"], 2)
+        self.assertEqual(counts["kept"], 1)
+
+    def test_a_repeated_text_counts_once_per_copy_seen_before_registration(self):
+        before_registration = self.snapshot_lines()
+        with open(self.queue, "a", encoding="utf-8") as f:
+            f.write(self.name_lines[0])
+        wrapper._dispose_queue_at_start(self.queue, self.OWN, named=False,
+                                        pre_lines=before_registration)
+        self.assertEqual(self.queue.read_text("utf-8"), self.name_lines[0])
+
+    def test_a_queue_that_did_not_exist_before_registration_is_all_new(self):
+        wrapper._dispose_queue_at_start(self.queue, self.OWN, named=False, pre_lines=[])
+        self.assertEqual(self.queue.read_text("utf-8"), "".join(self.name_lines))
+        self.assertEqual(self.queue.with_suffix(".failed.jsonl").read_text("utf-8"), self.retired_line)
+
+    def test_the_snapshot_reads_the_family_queues_without_writing(self):
+        root = self.queue.parent
+        family = {
+            "claude-2_queue.jsonl": self.name_lines[1],
+            "claude-music_queue.jsonl": self.retired_line,
+            "music_queue.jsonl": self.name_lines[0],
+            "codex_queue.jsonl": self.name_lines[0],
+        }
+        for name, text in family.items():
+            (root / name).write_text(text, "utf-8")
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
+        snap = wrapper._snapshot_queue_lines(root, "claude", "music")
+        self.assertEqual(set(snap), {root / "claude_queue.jsonl", root / "claude-2_queue.jsonl",
+                                     root / "claude-music_queue.jsonl", root / "music_queue.jsonl"})
+        self.assertEqual(snap[root / "claude_queue.jsonl"],
+                         [self.name_lines[0], self.retired_line, self.name_lines[1]])
+        self.assertEqual(snap[root / "music_queue.jsonl"], [self.name_lines[0]])
+        after = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
+        self.assertEqual(after, before)
+
+    def test_the_snapshot_of_an_unnamed_launch_has_no_extra_name(self):
+        snap = wrapper._snapshot_queue_lines(self.queue.parent, "claude", None)
+        self.assertEqual(set(snap), {self.queue})
 
     def test_a_wake_arriving_after_disposal_is_delivered_once_after_readiness(self):
         wrapper._dispose_queue_at_start(self.queue, self.OWN, named=False)

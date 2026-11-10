@@ -509,23 +509,53 @@ def _queue_line_identity(line: str) -> str:
     return iid if isinstance(iid, str) else ""
 
 
-def _dispose_queue_at_start(queue_file: Path, own_identity_id: str, named: bool) -> dict:
+def _snapshot_queue_lines(data_dir: Path, base: str, extra_name: str | None) -> dict:
+    """Read, before registering, every queue this launch could be given (ad-e5gz review F3).
+
+    The family's queues (`<base>`, `<base>-*`) and a --name's own queue, as
+    {path: lines}. Read-only: no lock file, no write. Lines present here were
+    queued before this launch registered, so only they can be recycled-name
+    backlog; a line that appears later was routed to the new registration."""
+    import re
+    paths = {data_dir / f"{base}_queue.jsonl"}
+    paths.update(data_dir.glob(f"{base}-*_queue.jsonl"))
+    # Only a name the server could grant (registry._NAME_RE): nothing outside data_dir is read.
+    if extra_name and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", extra_name):
+        paths.add(data_dir / f"{extra_name}_queue.jsonl")
+    snap = {}
+    for path in paths:
+        try:
+            snap[path] = path.read_text("utf-8").splitlines(keepends=True)
+        except (FileNotFoundError, IsADirectoryError):
+            continue
+    return snap
+
+
+def _dispose_queue_at_start(queue_file: Path, own_identity_id: str, named: bool,
+                            pre_lines: list[str] | None = None) -> dict:
     """Replace the old start-up erasure: no queued wake disappears without a copy.
 
     (a) every line is appended to `<queue>.startup.jsonl` first;
-    (b) lines addressed to another identity_id (a retired identity) go to the
-        stale-retained file for the controller, never injected;
-    (c) a --name return keeps the name-addressed lines queued (delivered once the
-        ownership fence opens); an unnamed launch clears them after the copy, since
-        a new agent on a recycled name is not their addressee.
+    (b) backlog lines addressed to another identity_id (a retired identity) go to
+        the stale-retained file for the controller, never injected;
+    (c) a --name return keeps the name-addressed backlog queued (delivered once the
+        ownership fence opens); an unnamed launch clears it after the copy, since
+        a new agent on a recycled name is not its addressee.
+    Backlog means a line already queued before registration: `pre_lines` is the
+    snapshot taken then (_snapshot_queue_lines), matched as a multiset, and every
+    line beyond it was routed to this registration and stays queued (review F3).
+    None treats every line as backlog. The caller must hold queue ownership
+    (review F2: run it only through _startup_disposer behind the watcher's fence).
     A batch a dead wrapper left mid-delivery is settled first, exactly as the
     watcher would (read_batch: preserved as uncertain, never resent). Hold records
     and earlier delivery-journal records are not touched.
     """
+    from collections import Counter
     counts = {"copied": 0, "kept": 0, "retained": 0, "cleared": 0}
     if not queue_file.exists():
         return counts
     read_batch(queue_file)
+    backlog = None if pre_lines is None else Counter(l.rstrip("\n") for l in pre_lines)
     stale = []
     with queue_lock(queue_file):
         try:
@@ -541,11 +571,15 @@ def _dispose_queue_at_start(queue_file: Path, own_identity_id: str, named: bool)
             os.fsync(copy.fileno())
         keep = []
         for line in lines:
+            key = line.rstrip("\n")
+            is_backlog = backlog is None or backlog[key] > 0
+            if backlog is not None and is_backlog:
+                backlog[key] -= 1
             iid = _queue_line_identity(line.strip())
             if iid and iid != own_identity_id:
-                stale.append(line)
-            elif iid or named:
-                keep.append(line)
+                stale.append(line)  # never this owner's, whenever it was queued
+            elif iid or named or not is_backlog:
+                keep.append(line)  # its own, a return's, or routed after registration
             else:
                 counts["cleared"] += 1
         with open(queue_file, "w", encoding="utf-8") as queue:
@@ -556,6 +590,34 @@ def _dispose_queue_at_start(queue_file: Path, own_identity_id: str, named: bool)
     if stale:
         retain_stale(queue_file, stale)
     return counts
+
+
+def _startup_disposer(queue_file: Path, get_identity_id_fn, named: bool,
+                      pre_lines: list[str] | None):
+    """The start-up disposition as a one-shot the queue watcher runs (review F2).
+
+    The watcher calls it only after the server has confirmed this wrapper owns
+    the queue, so a stale start-up reads, settles, copies and clears nothing.
+    It acts once, on the start-up queue only, and the flag is shared by every
+    watcher thread (a resurrected watcher does not dispose again)."""
+    state = {"pending": True}
+    lock = threading.Lock()
+
+    def dispose(path: Path):
+        with lock:
+            if not state["pending"]:
+                return None
+            state["pending"] = False
+        if Path(path) != queue_file:
+            return None  # a human rename moved the instance first; its next holder disposes
+        counts = _dispose_queue_at_start(queue_file, get_identity_id_fn(), named, pre_lines)
+        if counts["copied"]:
+            print(f"  Queue at start: {counts['copied']} line(s) copied to "
+                  f"{queue_file.with_suffix('.startup.jsonl').name}; kept {counts['kept']}, "
+                  f"retained {counts['retained']} for a retired identity, cleared {counts['cleared']}")
+        return counts
+
+    return dispose
 
 
 def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
@@ -719,15 +781,19 @@ def _queue_has_bytes(path: Path) -> bool:
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10, ready_flag=None, get_identity_id_fn=None,
-                   owns_queue_fn=None):
+                   owns_queue_fn=None, startup_fn=None):
     """Poll queue file and inject an MCP read task when triggered.
 
     `owns_queue_fn(name) -> bool` is the ownership fence (ad-e5gz F1): before
     reading a non-empty queue - and so before any injection, acknowledgement,
     attempt journal or hold record - the server must confirm that this
     wrapper's token owns the queue's name. One call per batch, none while the
-    queue is empty. Unconfirmed (stale token, someone else's name, server
-    unreachable): the batch stays queued, untouched."""
+    queue is empty, and one more before each retry of a batch proven not
+    pasted (review F1). Unconfirmed (stale token, someone else's name, server
+    unreachable): the batch stays queued, untouched.
+
+    `startup_fn(path)` is the start-up disposition (_startup_disposer), run
+    behind the same fence, before the first read (review F2)."""
     hold_check = getattr(inject_fn, 'hold_check', None)  # absent on Windows, whose flow is unchanged
     hold = _WakeHold(lambda channel, text: _post_hold_notice(
         server_port, get_token_fn() if get_token_fn else "", channel, text))
@@ -736,6 +802,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
     trigger_count = 0
     pending = []
     pending_file = None
+    queue_name = ""
     attempts = 0
     disposition = ''
     reason = None  # of an uncertain disposition, for the journal (ad-ruq); a fixed label, never prompt text
@@ -751,10 +818,13 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 continue
             if not pending:
                 queue_name, pending_file = get_identity_fn()
-                if owns_queue_fn is not None and _queue_has_bytes(pending_file):
-                    if not owns_queue_fn(queue_name):
+                if (owns_queue_fn is not None or startup_fn is not None) \
+                        and _queue_has_bytes(pending_file):
+                    if owns_queue_fn is not None and not owns_queue_fn(queue_name):
                         time.sleep(1)
                         continue
+                    if startup_fn is not None:
+                        startup_fn(pending_file)
                 pending = read_batch(pending_file)
                 attempts = 0
                 disposition = ''
@@ -769,6 +839,14 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     finish_batch(pending_file, pending, disposition, attempts, reason=reason,
                                  identity_id=own_identity or None)
                     pending = []
+                    continue
+
+                # Review F1: a retry of a batch proven not pasted asks again. Ownership lost
+                # since the read leaves the batch queued (its not-pasted row is journalled and
+                # its attempt record gone), for the reader the server names as the owner.
+                if attempts and owns_queue_fn is not None and not owns_queue_fn(queue_name):
+                    pending = []
+                    time.sleep(1)
                     continue
 
                 # ad-519: before any activity flag, rules sync, attempt or journal. The wake stays
@@ -1028,6 +1106,9 @@ def main():
     server_port = config.get("server", {}).get("port", 8300)
     mcp_cfg = config.get("mcp", {})
 
+    # Review F3: what was queued before this launch registers is the only possible backlog.
+    _queues_before_registration = _snapshot_queue_lines(data_dir, agent, args.name)
+
     if args.name:
         try:
             registration = _register_named(server_port, agent, args.label,
@@ -1172,12 +1253,11 @@ def main():
 
         return changed
 
+    # Review F2: start-up disposition runs in the queue watcher, behind the ownership fence, so a
+    # start-up the server no longer recognises settles, copies and clears nothing.
     queue_file = _identity["queue"]
-    disposed = _dispose_queue_at_start(queue_file, _identity["identity_id"], named=bool(args.name))
-    if disposed["copied"]:
-        print(f"  Queue at start: {disposed['copied']} line(s) copied to "
-              f"{queue_file.with_suffix('.startup.jsonl').name}; kept {disposed['kept']}, "
-              f"retained {disposed['retained']} for a retired identity, cleared {disposed['cleared']}")
+    _dispose_at_start = _startup_disposer(queue_file, get_identity_id, bool(args.name),
+                                          _queues_before_registration.get(queue_file, []))
 
     # Ownership fence (ad-e5gz F1): the queue watcher asks before every batch;
     # this records the state so a change is said once, visibly.
@@ -1334,7 +1414,7 @@ def main():
                     "get_token_fn": get_token, "refresh_interval": _refresh_interval,
                     "ready_flag": _ready_flag if ready_gate_cfg else None,
                     "get_identity_id_fn": get_identity_id,
-                    "owns_queue_fn": _owns_queue},
+                    "owns_queue_fn": _owns_queue, "startup_fn": _dispose_at_start},
             daemon=True,
         )
         _watcher_thread.start()
@@ -1354,7 +1434,7 @@ def main():
                             "get_token_fn": get_token, "refresh_interval": _refresh_interval,
                             "ready_flag": _ready_flag if ready_gate_cfg else None,
                             "get_identity_id_fn": get_identity_id,
-                            "owns_queue_fn": _owns_queue},
+                            "owns_queue_fn": _owns_queue, "startup_fn": _dispose_at_start},
                     daemon=True,
                 )
                 _watcher_thread.start()
