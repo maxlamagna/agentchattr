@@ -43,10 +43,25 @@ class Uncertain(str):
         return str(self)
 
 
+def _session_target(session_name: str) -> str:
+    """Exactly this session, for session commands (has/kill/attach).
+
+    A bare name is also a prefix: with no `agentchattr-x-codex` session, tmux resolves
+    `-t agentchattr-x-codex` to `agentchattr-x-codex-2`, so a launch of `codex` killed
+    `codex-2`'s agent (ad-e5gz launcher acceptance, Max #10212). `=` turns the prefix off.
+    """
+    return f"={session_name}"
+
+
+def _pane_target(session_name: str) -> str:
+    """Exactly this session's active pane, for pane commands (tmux 3.8 needs `=name:` there)."""
+    return f"={session_name}:"
+
+
 def _session_exists(session_name: str) -> bool:
     """Return True while the tmux session is still alive."""
     result = subprocess.run(
-        ["tmux", "has-session", "-t", session_name],
+        ["tmux", "has-session", "-t", _session_target(session_name)],
         capture_output=True,
     )
     return result.returncode == 0
@@ -67,7 +82,7 @@ def _check_tmux():
 def _pane_id(tmux_session: str) -> str | None:
     """Resolve the session's active pane once, so paste and Enter hit the same pane."""
     result = subprocess.run(
-        ["tmux", "display-message", "-p", "-t", tmux_session, "#{pane_id}"],
+        ["tmux", "display-message", "-p", "-t", _pane_target(tmux_session), "#{pane_id}"],
         capture_output=True, timeout=TMUX_COMMAND_TIMEOUT,
     )
     if result.returncode != 0:
@@ -337,7 +352,7 @@ def get_activity_checker(session_name, trigger_flag=None, *, provider=""):
             return True
         try:
             result = subprocess.run(
-                ["tmux", "capture-pane", "-t", session_name, "-p"],
+                ["tmux", "capture-pane", "-t", _pane_target(session_name), "-p"],
                 capture_output=True, timeout=2,
             )
             output = result.stdout
@@ -412,7 +427,7 @@ def run_agent(
     # Wire up injection with the tmux session name
     inject_fn = lambda text: inject(text, tmux_session=session_name, delay=inject_delay, provider=provider)
     # Travels with the injector, so the watcher and its monitor's replacement both hold (ad-519).
-    inject_fn.hold_check = settled_hold_check(session_name, provider)
+    inject_fn.hold_check = settled_hold_check(_pane_target(session_name), provider)
     if ready_gate_cfg is None:
         start_watcher(inject_fn)        # ungated: today's behavior, unchanged
     else:
@@ -440,7 +455,7 @@ def run_agent(
 
             # Clean up stale session from a previous crash
             subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
+                ["tmux", "kill-session", "-t", _session_target(session_name)],
                 capture_output=True,
             )
 
@@ -459,7 +474,7 @@ def run_agent(
 
                 def _cap():
                     r = subprocess.run(
-                        ["tmux", "capture-pane", "-p", "-t", session_name],
+                        ["tmux", "capture-pane", "-p", "-t", _pane_target(session_name)],
                         capture_output=True, timeout=5,
                     )
                     return r.stdout.decode(errors="replace") if r.returncode == 0 else None
@@ -490,7 +505,7 @@ def run_agent(
                         # dialog and is torn down on the next line.
                         print(f"  READY-GATE FAILED ({verdict}) - no live pane; "
                               f"read this log, not the screen")
-                        subprocess.run(["tmux", "kill-session", "-t", session_name],
+                        subprocess.run(["tmux", "kill-session", "-t", _session_target(session_name)],
                                        capture_output=True)
                     if on_failed:
                         try:
@@ -506,7 +521,7 @@ def run_agent(
                     # operator to it (G3 P2-1).
                     print(f"  READY-GATE FAILED (ready-post: {exc}) - no live pane; "
                           f"read this log, not the screen")
-                    subprocess.run(["tmux", "kill-session", "-t", session_name],
+                    subprocess.run(["tmux", "kill-session", "-t", _session_target(session_name)],
                                    capture_output=True)
                     if on_failed:
                         try:
@@ -516,7 +531,7 @@ def run_agent(
                     sys.exit(3)
 
             # Attach — blocks until agent exits or user detaches (Ctrl+B, D)
-            subprocess.run(["tmux", "attach-session", "-t", session_name])
+            subprocess.run(["tmux", "attach-session", "-t", _session_target(session_name)])
 
             # Check: did the agent exit, or did the user just detach?
             if _session_exists(session_name):
@@ -547,7 +562,7 @@ def run_agent(
         except KeyboardInterrupt:
             # Kill the tmux session on Ctrl+C
             subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
+                ["tmux", "kill-session", "-t", _session_target(session_name)],
                 capture_output=True,
             )
             break

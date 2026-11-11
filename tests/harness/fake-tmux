@@ -52,6 +52,10 @@ for arg in "$@"; do
     fi
     prev="$arg"
 done
+# As real tmux: `=name` (a session) and `=name:` (its active pane) are the exact-match
+# spellings of `name`; this stub only ever matches exactly.
+target="${target#=}"
+target="${target%:}"
 flag="$FAKE_TMUX_DIR/session.$target"
 
 serve_line() {
