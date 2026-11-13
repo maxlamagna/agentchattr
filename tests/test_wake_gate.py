@@ -64,6 +64,8 @@ HOLDS = [
     ("codex", "codex-draft-imitation", "no-prompt"),
     ("codex", "codex-draft-pasted", "typed"),
     ("codex", "codex-draft-command-mention", "typed"),
+    # Real capture, Codex 0.169.0, 87 columns, mid-turn: its status row wraps onto a second row (ad-44nu).
+    ("codex", "codex-0169-working-wrapped", "working"),
     ("agy", "agy-dialog", "dialog"),
     ("agy", "agy-trust", "dialog"),
     ("agy", "agy-working", "working"),
@@ -75,6 +77,8 @@ IDLES = [
     ("codex", "codex-idle-start"),
     ("codex", "codex-idle-after-turn"),
     ("codex", "codex-idle-after-clear"),
+    # Real capture, Codex 0.169.0, 87 columns, after a turn: the status row wraps onto a second row (ad-44nu).
+    ("codex", "codex-0169-idle-wrapped"),
     ("agy", "agy-idle-start-banner"),
     ("agy", "agy-idle-after-turn"),
 ]
@@ -197,6 +201,52 @@ class ClassifyTests(unittest.TestCase):
         for name in ("codex-idle-start", "codex-idle-after-turn"):
             with self.subTest(name=name):
                 self.assertEqual(wake_gate.classify("codex", screen(name) + "  TEXT BELOW THE FOOTER\n"), ("hold", "typed"))
+
+    def test_a_wrapped_codex_status_row_is_one_status_row(self):
+        """ad-44nu: Codex 0.169.0 wraps its status row onto a second row in an 87-column pane. Only that measured shape
+        qualifies: an upper row that is a status row on its own, painted throughout, then a row painted throughout (a
+        composer does not colour what is typed). Any other shape holds."""
+        idle = screen("codex-0169-idle-wrapped")
+        first, second = [row for row in idle.split("\n") if "% left" in row]
+        self.assertIn("\n\n" + first + "\n" + second + "\n", idle)  # Codex pads one blank row above it
+        self.assertIn("Context", first)
+        self.assertNotIn("Context", second)
+        status = lambda *rows: idle.replace(first + "\n" + second, "\n".join(rows))
+        unpadded = lambda *rows: idle.replace("\n\n" + first + "\n" + second, "\n" + "\n".join(rows))
+        paint, grey, cyan, end = "\x1b[38;2;242;181;144m", "\x1b[38;2;132;132;133m", "\x1b[36m", "\x1b[39m"
+        pasted = "  " + cyan + "[Pasted Content 2048 chars]" + end
+        # tmux carries colour across line ends, so an uncoloured row after a coloured one opens with `end`, as in `second`.
+        for name, text in (("the real two rows", idle), ("one row, as before the wrap", status(first))):
+            with self.subTest(name=name):
+                self.assertEqual(wake_gate.classify("codex", text), ("idle", ""))
+        for name, text in (
+                ("a draft above the wrapped row", status("  DRAFT ABOVE THE STATUS", first, second)),
+                ("a draft between its rows", status(first, end + "  DRAFT BETWEEN", second)),
+                ("an unpainted second row", status(first, end + "  80% left · weekly 81% left")),
+                ("a second row partly unpainted", status(first, "  " + paint + "80% left" + end + " · weekly 81% left")),
+                ("typed words imitating both rows", status("  GPT-6.1-Sol xhigh · Context 89% left · 5h", "  80% left")),
+                ("an upper row partly unpainted",
+                 status("  KEEP THIS · " + paint + "Context 89% left" + end, "  " + paint + "80% left" + end)),
+                ("two painted rows without the status field",
+                 status("  " + paint + "GPT-6.1-Sol xhigh" + grey + " · " + paint + "5h", "  " + paint + "80% left" + end)),
+                ("the field split across the rows, not measured",
+                 status("  " + paint + "GPT-6.1-Sol xhigh" + grey + " · " + paint + "Context",
+                        "  " + paint + "89% left" + grey + " · " + paint + "weekly 81% left" + end)),
+                ("the field on the second row, not measured",
+                 status("  " + paint + "GPT-6.1-Sol xhigh",
+                        "  " + paint + "~/Projects/x" + grey + " · " + paint + "Context 89% left" + end)),
+                # Independent review of ad-44nu: a painted row next to the status row is not part of it.
+                ("a painted placeholder directly above a one-row status", unpadded(pasted, first)),
+                ("a painted placeholder directly above the wrapped rows", unpadded(pasted, first, second)),
+                ("a painted row between the wrapped rows and the footer", unpadded(first, second, pasted)),
+                ("three painted rows with no blank row above", unpadded(first, second, "  " + paint + "475K window" + end))):
+            with self.subTest(name=name):
+                self.assertEqual(wake_gate.classify("codex", text)[0], "hold")
+
+    def test_a_wake_pasted_at_the_wrapped_codex_prompt_may_be_entered(self):
+        idle = screen("codex-0169-idle-wrapped")
+        self.assertIn(CODEX_PLACEHOLDER, idle)
+        self.assertEqual(wake_gate.enter_hold_reason("codex", idle.replace(CODEX_PLACEHOLDER, WAKE), WAKE), "")
 
     def test_a_draft_below_the_prompt_line_holds_on_the_ruled_providers(self):
         self.assertEqual(wake_gate.classify("claude", claude_prompt("\n  DRAFT"))[0], "hold")
@@ -330,6 +380,7 @@ class InjectGateTests(unittest.TestCase):
                 ("claude", screen("claude-idle-start"), claude_prompt(WAKE)),
                 ("claude", claude_prompt("\x1b[2mghost text\x1b[22m"), claude_prompt(WAKE)),
                 ("codex", screen("codex-idle-start"), codex_prompt(WAKE)),
+                ("codex", screen("codex-0169-idle-wrapped"), screen("codex-0169-idle-wrapped").replace(CODEX_PLACEHOLDER, WAKE)),
                 ("agy", screen("agy-idle-start-banner"), agy_prompt(WAKE))):
             with self.subTest(provider=provider, before=before[-40:]):
                 self.fake.set_screens(before, after)

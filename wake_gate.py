@@ -25,11 +25,13 @@ PROFILES = {
     # working_above: lines above the prompt also searched, for a CLI that shows it there.
     # lit_glyph: the glyph is grey while busy. Claude's footer alone is not enough: a transient hint
     # ("paste again to expand") replaces "esc to interrupt" mid-turn (real-claude-1, a-answered).
-    # Measured on Claude Code 2.1.318, Codex 0.166.0 and Antigravity 1.4.12.
+    # Measured on Claude Code 2.1.318, Codex 0.166.0 and Antigravity 1.4.12; also Codex 0.169.0's status row
+    # wrapping onto a second row in an 87-column pane (ad-44nu).
     "claude": {"glyph": "❯", "ruled": True, "footer": "", "working": re.compile("esc to interrupt"), "working_above": 0,
                "lit_glyph": True},
     # status: the one row an unruled composer may have between it and its footer. Group 1 must be painted: Codex
     # colours that field and a composer does not colour what is typed, so words alone never qualify a row.
+    # A wrapped status row qualifies only as _status_rows() says.
     "codex": {"glyph": "›", "ruled": False, "footer": "? for shortcuts", "status": re.compile(r"·.*\b(Context \d+% left)"),
               "working": re.compile(r"\(.*esc to interrupt\)"), "working_above": 6, "lit_glyph": False},
     "agy": {"glyph": ">", "ruled": True, "footer": "? for shortcuts", "working": re.compile("esc to cancel"), "working_above": 0,
@@ -158,10 +160,31 @@ def _status_row(profile, line):
     return bool(match) and all(line[2][match.start(1):match.end(1)])
 
 
+def _painted_throughout(line):
+    """Every visible character in an explicit colour. A composer does not colour what is typed."""
+    cells = [painted for ch, painted in zip(line[0], line[2]) if not ch.isspace() and ch not in _CODEX_PARTICLES]
+    return bool(cells) and all(cells)
+
+
+def _status_rows(profile, rows):
+    """How many rows at the end of `rows` are the provider's status row, 0 when none.
+
+    One row qualifies as before. Codex 0.169.0 wraps the row onto a second row in an 87-column pane (ad-44nu), and only
+    that measured shape qualifies as two: an upper row that qualifies on its own and is painted throughout, then a row
+    painted throughout (a composer does not colour what is typed). Any other shape holds.
+    """
+    if rows and _status_row(profile, rows[-1]):
+        return 1
+    if (len(rows) >= 2 and _status_row(profile, rows[-2]) and _painted_throughout(rows[-2])
+            and _painted_throughout(rows[-1])):
+        return 2
+    return 0
+
+
 def _draft_below(profile, below):
     """An unruled composer has no border under it, so a draft's later lines sit between it and the footer.
 
-    Empty means blank rows, then at most one status row directly above a footer that ends the screen.
+    Empty means blank rows, then at most one status row (which may wrap) directly above a footer that ends the screen.
     """
     rows = list(below)
     while rows and not rows[-1][0].strip():
@@ -169,8 +192,7 @@ def _draft_below(profile, below):
     if not rows or profile["footer"] not in rows[-1][0]:
         return True
     rows.pop()
-    if rows and _status_row(profile, rows[-1]):
-        rows.pop()
+    del rows[len(rows) - _status_rows(profile, rows):]
     return any(row[0].strip(_CODEX_PARTICLES + "\t\xa0") for row in rows)
 
 
